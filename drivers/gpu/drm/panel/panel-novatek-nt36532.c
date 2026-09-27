@@ -386,6 +386,237 @@ static const struct drm_dsc_config csot_dsc_cfg = {
 	.block_pred_enable = true,
 };
 
+/*
+ * Xiaomi Pad 8 Pro panels, following the downstream "p81 42 02 0a" (BOE)
+ * and "p81 35 02 0b" (CSOT) video mode dual-DSI DSC panel descriptions.
+ *
+ * The link runs at a fixed 1197.5 Mbps per lane and the refresh rate is
+ * selected by the horizontal front porch. With RGB101010 and 8 bpp DSC the
+ * modes below reproduce exactly that link rate. The 60 Hz mode keeps the
+ * 120 Hz panel timing with a doubled vertical total, like the downstream
+ * dynamic refresh rate implementation.
+ */
+#define PIANO_HDISPLAY	3200
+#define PIANO_HSYNC	32
+#define PIANO_HBP	32
+#define PIANO_VDISPLAY	2136
+#define PIANO_VFP	68
+#define PIANO_VSYNC	2
+#define PIANO_VBP	104
+#define PIANO_VTOTAL	(PIANO_VDISPLAY + PIANO_VFP + PIANO_VSYNC + PIANO_VBP)
+
+#define PIANO_MODE(_hfp, _vfp, _vrefresh) {					\
+	.clock = (PIANO_HDISPLAY + (_hfp) + PIANO_HSYNC + PIANO_HBP) *		\
+		 (PIANO_VDISPLAY + (_vfp) + PIANO_VSYNC + PIANO_VBP) *		\
+		 (_vrefresh) / 1000,						\
+	.hdisplay = PIANO_HDISPLAY,						\
+	.hsync_start = PIANO_HDISPLAY + (_hfp),					\
+	.hsync_end = PIANO_HDISPLAY + (_hfp) + PIANO_HSYNC,			\
+	.htotal = PIANO_HDISPLAY + (_hfp) + PIANO_HSYNC + PIANO_HBP,		\
+	.vdisplay = PIANO_VDISPLAY,						\
+	.vsync_start = PIANO_VDISPLAY + (_vfp),					\
+	.vsync_end = PIANO_VDISPLAY + (_vfp) + PIANO_VSYNC,			\
+	.vtotal = PIANO_VDISPLAY + (_vfp) + PIANO_VSYNC + PIANO_VBP,		\
+	.width_mm = 239,							\
+	.height_mm = 163,							\
+}
+
+static const struct drm_display_mode piano_display_modes[] = {
+	PIANO_MODE(42, PIANO_VFP, 144),
+	PIANO_MODE(234, PIANO_VFP, 120),
+	PIANO_MODE(618, PIANO_VFP, 90),
+	PIANO_MODE(234, PIANO_VFP + PIANO_VTOTAL, 60),
+};
+
+static const struct regulator_bulk_data piano_supplies[] = {
+	{ .supply = "vddio" },
+	{ .supply = "avdd" },
+	{ .supply = "avee" },
+};
+
+static const struct drm_dsc_config piano_dsc_cfg = {
+	.dsc_version_major = 1,
+	.dsc_version_minor = 1,
+	.slice_height = 24,
+	.slice_width = 800,
+	.slice_count = 2,
+	.bits_per_component = 10,
+	.bits_per_pixel = 8 << 4,
+	.block_pred_enable = true,
+};
+
+static void piano_boe_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
+{
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc4, 0x82);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x26);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3b, 0x06);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4b, 0x06);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x22);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc4, 0x06);
+}
+
+static void piano_csot_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
+{
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbc, 0x77, 0x07);
+}
+
+static int piano_init_sequence(struct nt36532 *ctx,
+			       const struct drm_display_mode *mode,
+			       u8 esd_cfg,
+			       void (*vendor_sequence)(struct mipi_dsi_multi_context *))
+{
+	struct mipi_dsi_multi_context multi_ctx = { .dsi = to_primary_dsi(ctx) };
+	struct mipi_dsi_multi_context *dsi_ctx = &multi_ctx;
+	struct drm_dsc_picture_parameter_set pps;
+
+	/* ESD init */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x27);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xd0, 0x31);
+	mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, 0xd1, esd_cfg);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xd2, 0x38);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xde, 0x43);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xdf, 0x02);
+	/* CABC start */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x23);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x00, 0x80);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x01, 0x84);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x05, 0x2d);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x06, 0x00);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x11, 0x04);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x12, 0x2c);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x15, 0x9e);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x16, 0x16);
+	/* UI mode */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x29, 0x0a);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x30, 0xff);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x31, 0xfe);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x32, 0xfd);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x33, 0xfb);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x34, 0xf8);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x35, 0xf5);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x36, 0xf3);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x37, 0xf2);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x38, 0xf2);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x39, 0xf2);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3a, 0xef);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3b, 0xec);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3d, 0xe9);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3f, 0xe5);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x40, 0xe5);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x41, 0xe5);
+	/* STILL mode */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x2a, 0x13);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x45, 0xff);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x46, 0xf4);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x47, 0xe7);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x48, 0xda);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x49, 0xcd);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4a, 0xc0);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4b, 0xb3);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4c, 0xb1);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4d, 0xb1);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4e, 0xb1);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4f, 0x95);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x50, 0x79);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x51, 0x5c);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x52, 0x58);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x53, 0x58);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x54, 0x58);
+	/* MOVING mode */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x2b, 0x0e);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x58, 0xff);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x59, 0xfb);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x5a, 0xf7);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x5b, 0xf3);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x5c, 0xef);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x5d, 0xe3);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x5e, 0xd8);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x5f, 0xd6);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x60, 0xd6);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x61, 0xd6);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x62, 0xc8);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x63, 0xb7);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x64, 0xaa);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x65, 0xa8);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x66, 0xa8);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x67, 0xa8);
+	/* Open PWM for CABC */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x10);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x51, 0x0f, 0xff);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x53, 0x24);
+	/* CABC end */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x25);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x0f, 0x20);
+	/* Fix audio hall */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x27);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x13, 0x00);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x14, 0x11);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x2a);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	vendor_sequence(dsi_ctx);
+	/* Original init code */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0xf0);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfa, 0x05);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x76, 0x16);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x10);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3b, 0x03, 0x6a, 0x44, 0x04, 0x04,
+				     0x00);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x90, 0x03);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x91, 0xab, 0xa8, 0x00, 0x18, 0xd2, 0x00,
+				     0x00, 0x00, 0x02, 0x9f, 0x00, 0x0b, 0x04,
+				     0x86, 0x02, 0xdc);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x92, 0x10, 0xf0);
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x9d, 0x01);
+
+	/* Panel side refresh rate control */
+	switch (drm_mode_vrefresh(mode)) {
+	case 144:
+		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb3, 0x00);
+		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb2, 0x00);
+		break;
+	case 90:
+		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb3, 0x80);
+		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb2, 0x00);
+		break;
+	default:
+		/* 120 Hz panel timing, also used for 60 Hz */
+		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb3, 0x40);
+		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb2, 0x91);
+		break;
+	}
+
+	mipi_dsi_dcs_exit_sleep_mode_multi(dsi_ctx);
+	mipi_dsi_msleep(dsi_ctx, 120);
+	mipi_dsi_dcs_set_display_on_multi(dsi_ctx);
+
+	/* Downstream sends the PPS once the panel is on */
+	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+	mipi_dsi_picture_parameter_set_multi(dsi_ctx, &pps);
+
+	return dsi_ctx->accum_err;
+}
+
+static int piano_boe_init_sequence(struct nt36532 *ctx,
+				   const struct drm_display_mode *mode)
+{
+	return piano_init_sequence(ctx, mode, 0x20, piano_boe_vendor_sequence);
+}
+
+static int piano_csot_init_sequence(struct nt36532 *ctx,
+				    const struct drm_display_mode *mode)
+{
+	return piano_init_sequence(ctx, mode, 0x00, piano_csot_vendor_sequence);
+}
+
 static int nt36532_probe(struct mipi_dsi_device *dsi)
 {
 	struct mipi_dsi_device_info dsi_info = {"nt36532-secondary", 0, NULL};
@@ -487,8 +718,30 @@ static const struct panel_info csot_panel_info = {
 	.is_dual_dsi = true,
 };
 
+#define PIANO_PANEL_INFO(_init) {						\
+	.lanes = 4,								\
+	.format = MIPI_DSI_FMT_RGB101010,					\
+	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |	\
+		      MIPI_DSI_MODE_LPM,					\
+	.modes = piano_display_modes,						\
+	.num_modes = ARRAY_SIZE(piano_display_modes),				\
+	.supplies = piano_supplies,						\
+	.num_supplies = ARRAY_SIZE(piano_supplies),				\
+	.dsc_cfg = &piano_dsc_cfg,						\
+	.init_sequence = _init,							\
+	.is_dual_dsi = true,							\
+}
+
+static const struct panel_info piano_boe_panel_info =
+	PIANO_PANEL_INFO(piano_boe_init_sequence);
+
+static const struct panel_info piano_csot_panel_info =
+	PIANO_PANEL_INFO(piano_csot_init_sequence);
+
 static const struct of_device_id nt36532_of_match[] = {
 	{ .compatible = "csot,ppc100hb1-1", .data = &csot_panel_info },
+	{ .compatible = "xiaomi,piano-boe-nt36532", .data = &piano_boe_panel_info },
+	{ .compatible = "xiaomi,piano-csot-nt36532", .data = &piano_csot_panel_info },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, nt36532_of_match);
