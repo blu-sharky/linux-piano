@@ -598,6 +598,19 @@ static int piano_init_sequence(struct nt36532 *ctx,
 	mipi_dsi_msleep(dsi_ctx, 120);
 	mipi_dsi_dcs_set_display_on_multi(dsi_ctx);
 
+	/*
+	 * The panel decodes with the rate control of the downstream NT36532
+	 * profile, which differs from the VESA DSC 1.1 10 bpc / 8 bpp
+	 * defaults the host just set up: first line BPG offset 13 instead
+	 * of 12 and a max QP of 8 for range 0. Anything else makes the
+	 * decoder lose track after a few hundred lines. The DPU programs
+	 * its encoder from this config later in the commit.
+	 */
+	ctx->dsc.first_line_bpg_offset = 13;
+	ctx->dsc.rc_range_params[0].range_max_qp = 8;
+	if (!dsi_ctx->accum_err)
+		dsi_ctx->accum_err = drm_dsc_compute_rc_parameters(&ctx->dsc);
+
 	/* Downstream sends the PPS once the panel is on */
 	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
 	mipi_dsi_picture_parameter_set_multi(dsi_ctx, &pps);
