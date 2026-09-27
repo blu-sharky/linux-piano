@@ -18,13 +18,15 @@
 
 #include <drm/display/drm_dsc.h>
 #include <drm/display/drm_dsc_helper.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
-#include <drm/drm_probe_helper.h>
 
 struct nt36532 {
 	struct drm_panel panel;
+	struct drm_connector *connector;
 	struct mipi_dsi_device *dsi[2];
 	const struct panel_info *panel_info;
 	struct drm_dsc_config dsc;
@@ -37,11 +39,18 @@ struct panel_info {
 	enum mipi_dsi_pixel_format format;
 	unsigned long mode_flags;
 
-	const struct drm_display_mode display_mode;
+	/* The first mode is the preferred one */
+	const struct drm_display_mode *modes;
+	unsigned int num_modes;
+
+	/* Enabled in this order and disabled in reverse order */
+	const struct regulator_bulk_data *supplies;
+	unsigned int num_supplies;
 
 	const struct drm_dsc_config *dsc_cfg;
 
-	int (*init_sequence)(struct nt36532 *ctx);
+	int (*init_sequence)(struct nt36532 *ctx,
+			     const struct drm_display_mode *mode);
 
 	bool is_dual_dsi;
 };
@@ -61,6 +70,52 @@ static inline struct mipi_dsi_device *to_primary_dsi(struct nt36532 *ctx)
 	return ctx->panel_info->is_dual_dsi ? ctx->dsi[1] : ctx->dsi[0];
 }
 
+static const struct drm_display_mode *nt36532_current_mode(struct nt36532 *ctx)
+{
+	const struct panel_info *panel_info = ctx->panel_info;
+	const struct drm_display_mode *mode;
+	unsigned int i;
+
+	if (!ctx->connector || !ctx->connector->state ||
+	    !ctx->connector->state->crtc)
+		return &panel_info->modes[0];
+
+	mode = &ctx->connector->state->crtc->state->adjusted_mode;
+	for (i = 0; i < panel_info->num_modes; i++)
+		if (drm_mode_match(mode, &panel_info->modes[i],
+				   DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK))
+			return &panel_info->modes[i];
+
+	return &panel_info->modes[0];
+}
+
+static int nt36532_power_on(struct nt36532 *ctx)
+{
+	const struct panel_info *panel_info = ctx->panel_info;
+	int i, ret;
+
+	for (i = 0; i < panel_info->num_supplies; i++) {
+		ret = regulator_enable(ctx->supplies[i].consumer);
+		if (ret) {
+			while (--i >= 0)
+				regulator_disable(ctx->supplies[i].consumer);
+			return ret;
+		}
+		if (panel_info->num_supplies > 1)
+			usleep_range(2000, 3000);
+	}
+
+	return 0;
+}
+
+static void nt36532_power_off(struct nt36532 *ctx)
+{
+	int i;
+
+	for (i = ctx->panel_info->num_supplies - 1; i >= 0; i--)
+		regulator_disable(ctx->supplies[i].consumer);
+}
+
 static void nt36532_reset(struct nt36532 *ctx)
 {
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
@@ -76,18 +131,16 @@ static int nt36532_prepare(struct drm_panel *panel)
 	struct nt36532 *ctx = to_nt36532(panel);
 	int ret;
 
-	ret = regulator_bulk_enable(ARRAY_SIZE(nt36532_supplies),
-				    ctx->supplies);
+	ret = nt36532_power_on(ctx);
 	if (ret < 0)
 		return ret;
 
 	nt36532_reset(ctx);
 
-	ret = ctx->panel_info->init_sequence(ctx);
+	ret = ctx->panel_info->init_sequence(ctx, nt36532_current_mode(ctx));
 	if (ret < 0) {
 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-		regulator_bulk_disable(ARRAY_SIZE(nt36532_supplies),
-				       ctx->supplies);
+		nt36532_power_off(ctx);
 		return ret;
 	}
 
@@ -118,7 +171,7 @@ static int nt36532_unprepare(struct drm_panel *panel)
 		dev_err(dev, "Failed to un-initialize panel: %d\n", ret);
 
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	regulator_bulk_disable(ARRAY_SIZE(nt36532_supplies), ctx->supplies);
+	nt36532_power_off(ctx);
 
 	return 0;
 }
@@ -128,9 +181,28 @@ static int nt36532_get_modes(struct drm_panel *panel,
 {
 	struct nt36532 *ctx = to_nt36532(panel);
 	const struct panel_info *panel_info = ctx->panel_info;
+	unsigned int i;
 
-	return drm_connector_helper_get_modes_fixed(connector,
-						    &panel_info->display_mode);
+	for (i = 0; i < panel_info->num_modes; i++) {
+		struct drm_display_mode *mode;
+
+		mode = drm_mode_duplicate(connector->dev, &panel_info->modes[i]);
+		if (!mode)
+			return -ENOMEM;
+
+		mode->type = DRM_MODE_TYPE_DRIVER;
+		if (i == 0)
+			mode->type |= DRM_MODE_TYPE_PREFERRED;
+
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+	}
+
+	connector->display_info.width_mm = panel_info->modes[0].width_mm;
+	connector->display_info.height_mm = panel_info->modes[0].height_mm;
+	ctx->connector = connector;
+
+	return panel_info->num_modes;
 }
 
 static const struct drm_panel_funcs nt36532_panel_funcs = {
@@ -139,7 +211,8 @@ static const struct drm_panel_funcs nt36532_panel_funcs = {
 	.get_modes = nt36532_get_modes,
 };
 
-static int csot_init_sequence(struct nt36532 *ctx)
+static int csot_init_sequence(struct nt36532 *ctx,
+			      const struct drm_display_mode *mode)
 {
 	struct mipi_dsi_device *dsi = to_primary_dsi(ctx);
 	struct drm_dsc_picture_parameter_set pps;
@@ -330,9 +403,14 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 
+	ctx->panel_info = of_device_get_match_data(dev);
+	panel_info = ctx->panel_info;
+	if (!panel_info)
+		return -ENODEV;
+
 	ret = devm_regulator_bulk_get_const(&dsi->dev,
-					    ARRAY_SIZE(nt36532_supplies),
-					    nt36532_supplies, &ctx->supplies);
+					    panel_info->num_supplies,
+					    panel_info->supplies, &ctx->supplies);
 	if (ret < 0)
 		return ret;
 
@@ -340,11 +418,6 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx->reset_gpio))
 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
 				     "Failed to get reset-gpios\n");
-
-	ctx->panel_info = of_device_get_match_data(dev);
-	panel_info = ctx->panel_info;
-	if (!panel_info)
-		return -ENODEV;
 
 	ctx->dsc = *panel_info->dsc_cfg;
 
@@ -405,7 +478,10 @@ static const struct panel_info csot_panel_info = {
 	.format = MIPI_DSI_FMT_RGB888,
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |
 		      MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT,
-	.display_mode = csot_display_mode,
+	.modes = &csot_display_mode,
+	.num_modes = 1,
+	.supplies = nt36532_supplies,
+	.num_supplies = ARRAY_SIZE(nt36532_supplies),
 	.dsc_cfg = &csot_dsc_cfg,
 	.init_sequence = csot_init_sequence,
 	.is_dual_dsi = true,
