@@ -432,7 +432,13 @@ static const u8 piano_keyboard_descriptor[] = {
 	0xC0,             /* End Collection */
 };
 
-/* Touchpad of the Pad 8 Pro cover: three contacts with pressure. */
+/*
+ * Touchpad of the Pad 8 Pro cover: three contacts.  The stock descriptor
+ * declares a 16-bit tip pressure per contact (0..65535), but the MCU always
+ * reports 32 there.  libinput derives its touch-down threshold from that
+ * range and would never see a finger, so the pressure fields are declared
+ * constant: the report layout is unchanged and no pressure axis is exported.
+ */
 static const u8 piano_touchpad_descriptor[] = {
 	0x05, 0x0D,       /* Usage Page (Digitizer) */
 	0x09, 0x05,       /* Usage (Touch Pad) */
@@ -474,7 +480,7 @@ static const u8 piano_touchpad_descriptor[] = {
 	0x75, 0x10,       /*     Report Size (16) */
 	0x09, 0x30,       /*     Usage (Tip Pressure) */
 	0x95, 0x01,       /*     Report Count (1) */
-	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x81, 0x03,       /*     Input (Const,Var,Abs), see above */
 	0x05, 0x01,       /*     Usage Page (Generic Desktop) */
 	0x15, 0x00,       /*     Logical Minimum (0) */
 	0x26, 0x7F, 0x0C, /*     Logical Maximum (3199) */
@@ -513,7 +519,7 @@ static const u8 piano_touchpad_descriptor[] = {
 	0x75, 0x10,       /*     Report Size (16) */
 	0x09, 0x30,       /*     Usage (Tip Pressure) */
 	0x95, 0x01,       /*     Report Count (1) */
-	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x81, 0x03,       /*     Input (Const,Var,Abs), see above */
 	0x05, 0x01,       /*     Usage Page (Generic Desktop) */
 	0x15, 0x00,       /*     Logical Minimum (0) */
 	0x26, 0x7F, 0x0C, /*     Logical Maximum (3199) */
@@ -552,7 +558,7 @@ static const u8 piano_touchpad_descriptor[] = {
 	0x75, 0x10,       /*     Report Size (16) */
 	0x09, 0x30,       /*     Usage (Tip Pressure) */
 	0x95, 0x01,       /*     Report Count (1) */
-	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x81, 0x03,       /*     Input (Const,Var,Abs), see above */
 	0x05, 0x01,       /*     Usage Page (Generic Desktop) */
 	0x15, 0x00,       /*     Logical Minimum (0) */
 	0x26, 0x7F, 0x0C, /*     Logical Maximum (3199) */
