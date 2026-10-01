@@ -17,8 +17,9 @@
  * This driver replaces qcom_battmgr on this board.  By default only reads
  * are issued and charging limits stay with the ADSP firmware defaults (float
  * voltage 4350 mV, charge current 3000 mA, JEITA window 0-55 degC).  With
- * charge_policy=1 it raises the input current limit by charger type, and
- * with hv_charge=1 as well it asks PD sources for 9 V; those are the only
+ * charge_policy=1 it raises the input current limit by charger type, with
+ * charge_current=1 as well the charge current, and with hv_charge=1 it asks
+ * PD sources for 9 V; those are the only
  * properties it ever writes (see piano_mca_write_u32()).  The battery itself
  * is reported by the two bq27z561 fuel gauges; this driver adds the USB
  * input (presence from the bus voltage, bus current, input current limit and
@@ -41,6 +42,7 @@
 #define MCA_OP_WRITE		2
 
 /* Property ids recovered from the stock charger stack */
+#define MCA_PROP_FCC		0x2005	/* charge current, mA */
 #define MCA_PROP_ICL		0x2008	/* input current limit, mA */
 #define MCA_PROP_PACK_TBAT	0x202a	/* degC */
 #define MCA_PROP_BUS_VOLT	0x20002	/* uV */
@@ -121,6 +123,25 @@ MODULE_PARM_DESC(charge_policy,
 		 "Raise the USB input current limit by charger type (default: off, ADSP defaults)");
 
 /*
+ * charge_current: left alone, the ADSP charges the battery at about 500 mA
+ * whatever the source.  Stock sets the charge current by charger type (its
+ * buck strategy chg_* values) and a JEITA table that allows far more than
+ * the ceiling below between 13 and 48 degC; this sets the charger-type value,
+ * capped, and only inside a narrower temperature window.  Detach, unbind and
+ * ADSP restarts put the fallback value back.
+ */
+#define MCA_FCC_MIN_MA		100
+#define MCA_FCC_MAX_MA		2000
+#define MCA_FCC_DEFAULT_MA	500
+#define MCA_FCC_TBAT_MIN	15
+#define MCA_FCC_TBAT_MAX	40
+
+static bool charge_current;
+module_param(charge_current, bool, 0444);
+MODULE_PARM_DESC(charge_current,
+		 "Raise the battery charge current by charger type; needs charge_policy (default: off, about 500 mA)");
+
+/*
  * hv_charge: a PD source with a fixed 9 V PDO is asked for 9 V, as the
  * stock buck strategy does.  The bus has to settle within the window below
  * in a few polls and stay there; otherwise, or when the battery leaves the
@@ -183,6 +204,7 @@ struct piano_mca {
 	int icl_ma;
 	u32 real_type;
 	int icl_set_ma;		/* last limit written by charge_policy, 0 if none */
+	int fcc_set_ma;		/* last current written by charge_current, 0 if none */
 	enum piano_mca_hv hv;
 	int hv_polls;
 	unsigned long hv_retry;	/* jiffies before which 9 V is not asked for */
@@ -229,6 +251,7 @@ static void piano_mca_pdr_notify(void *priv, int state)
 	mca->service_up = state == SERVREG_SERVICE_STATE_UP;
 	/* A restarted ADSP is back on its defaults */
 	mca->icl_set_ma = 0;
+	mca->fcc_set_ma = 0;
 	mca->hv = MCA_HV_OFF;
 	mod_delayed_work(system_percpu_wq, &mca->poll, 0);
 }
@@ -300,6 +323,10 @@ static int piano_mca_write_u32(struct piano_mca *mca, u32 prop, u32 val)
 	case MCA_PROP_ICL:
 		if (val < MCA_ICL_MIN_MA || val > MCA_ICL_MAX_MA)
 			return -ERANGE;
+		break;
+	case MCA_PROP_FCC:
+		if (!charge_current || val < MCA_FCC_MIN_MA || val > MCA_FCC_MAX_MA)
+			return -EPERM;
 		break;
 	case MCA_PROP_PD_FIXED_VOLT:
 		if (!hv_charge || (val != 5000 && val != MCA_HV_MV))
@@ -380,6 +407,60 @@ static void piano_mca_reset_icl(struct piano_mca *mca)
 {
 	if (!piano_mca_write_u32(mca, MCA_PROP_ICL, MCA_ICL_MIN_MA))
 		mca->icl_set_ma = 0;
+}
+
+/* The ADSP keeps the charge current too; put the fallback value back */
+static void piano_mca_reset_fcc(struct piano_mca *mca)
+{
+	if (!piano_mca_write_u32(mca, MCA_PROP_FCC, MCA_FCC_DEFAULT_MA))
+		mca->fcc_set_ma = 0;
+}
+
+/* Stock buck strategy chg_* charge currents (mA) per charger type */
+static u32 piano_mca_policy_fcc(u32 real_type)
+{
+	switch (real_type) {
+	case MCA_TYPE_CDP:
+		return 900;
+	case MCA_TYPE_FLOAT:
+		return 1000;
+	case MCA_TYPE_DCP:
+	case MCA_TYPE_DCP_B:
+		return 2000;
+	case MCA_TYPE_HVDCP:
+		return 2600;
+	case MCA_TYPE_HVDCP_3:
+	case MCA_TYPE_HVDCP_3_B:
+	case MCA_TYPE_HVDCP_3P5:
+		return 3600;
+	case MCA_TYPE_PD:
+	case MCA_TYPE_PD_VERIFY:
+		return 3000;
+	case MCA_TYPE_PD_PPS:
+		return 3500;
+	default:
+		return MCA_FCC_DEFAULT_MA;
+	}
+}
+
+static void piano_mca_apply_fcc(struct piano_mca *mca, int tbat)
+{
+	u32 target = min_t(u32, piano_mca_policy_fcc(mca->real_type),
+			   MCA_FCC_MAX_MA);
+
+	if (tbat < MCA_FCC_TBAT_MIN || tbat > MCA_FCC_TBAT_MAX)
+		target = MCA_FCC_DEFAULT_MA;
+	if (target == mca->fcc_set_ma)
+		return;
+
+	if (piano_mca_write_u32(mca, MCA_PROP_FCC, target)) {
+		dev_warn(mca->dev, "failed to set charge current %u mA\n", target);
+		return;
+	}
+
+	dev_info(mca->dev, "%s: charge current %u mA (battery %d degC)\n",
+		 piano_mca_type_name(mca->real_type) ?: "Unknown", target, tbat);
+	mca->fcc_set_ma = target;
 }
 
 static bool piano_mca_is_pd(u32 real_type)
@@ -473,6 +554,9 @@ static void piano_mca_apply_policy(struct piano_mca *mca)
 	u32 hv_ma;
 	int ret;
 
+	if (charge_current)
+		piano_mca_apply_fcc(mca, tbat);
+
 	hv_ma = piano_mca_hv_step(mca, tbat);
 	if (hv_ma)
 		target = clamp(hv_ma, MCA_ICL_MIN_MA, target);
@@ -523,6 +607,8 @@ static void piano_mca_poll(struct work_struct *work)
 	if (!online) {
 		if (mca->icl_set_ma)
 			piano_mca_reset_icl(mca);
+		if (mca->fcc_set_ma)
+			piano_mca_reset_fcc(mca);
 		/* a hard reset in answer to the request looks like a detach */
 		if (mca->hv == MCA_HV_REQUESTED)
 			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RETRY_MS);
@@ -654,6 +740,8 @@ static void piano_mca_stop(void *data)
 		piano_mca_write_u32(mca, MCA_PROP_PD_FIXED_VOLT, 5000);
 	if (mca->icl_set_ma)
 		piano_mca_reset_icl(mca);
+	if (mca->fcc_set_ma)
+		piano_mca_reset_fcc(mca);
 }
 
 /* debugfs: write a property id to "prop", read the raw reply from "data" */
