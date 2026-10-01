@@ -1169,10 +1169,23 @@ static int nanosic_wn8030_power_on(struct nanosic_wn8030 *nanosic)
 	const struct nanosic_wn8030_variant *variant = nanosic->variant;
 	int ret;
 
-	ret = regulator_bulk_enable(ARRAY_SIZE(nanosic_wn8030_supply_names),
-				    nanosic->supplies);
+	/*
+	 * One at a time, I/O first: regulator_bulk_enable() gives no order,
+	 * and the 3.3 V supply must never be up while the 1.8 V I/O supply
+	 * is down.
+	 */
+	ret = regulator_enable(nanosic->supplies[0].consumer);
 	if (ret) {
-		dev_err(nanosic->dev, "failed to enable regulators\n");
+		dev_err(nanosic->dev, "failed to enable %s\n",
+			nanosic->supplies[0].supply);
+		return ret;
+	}
+
+	ret = regulator_enable(nanosic->supplies[1].consumer);
+	if (ret) {
+		dev_err(nanosic->dev, "failed to enable %s\n",
+			nanosic->supplies[1].supply);
+		regulator_disable(nanosic->supplies[0].consumer);
 		return ret;
 	}
 
@@ -1194,7 +1207,8 @@ static void nanosic_wn8030_power_off(struct nanosic_wn8030 *nanosic)
 	gpiod_set_value_cansleep(nanosic->sleep_gpio, 1);
 	gpiod_set_value_cansleep(nanosic->reset_gpio, 1);
 	msleep(10);
-	regulator_bulk_disable(ARRAY_SIZE(nanosic_wn8030_supply_names), nanosic->supplies);
+	regulator_disable(nanosic->supplies[1].consumer);
+	regulator_disable(nanosic->supplies[0].consumer);
 }
 
 static void nanosic_wn8030_wake_worker(struct work_struct *data)
