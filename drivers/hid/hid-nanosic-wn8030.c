@@ -358,6 +358,235 @@ static u8 hid_touchpad_descriptor[] = {
 	0xC0,              // End Collection
 };
 
+/* Keyboard, consumer control and mouse reports of the Pad 8 Pro cover. */
+static const u8 piano_keyboard_descriptor[] = {
+	0x05, 0x01,       /* Usage Page (Generic Desktop) */
+	0x09, 0x06,       /* Usage (Keyboard) */
+	0xA1, 0x01,       /* Collection (Application) */
+	0x85, 0x05,       /*   Report ID (5) */
+	0x05, 0x07,       /*   Usage Page (Keyboard/Keypad) */
+	0x19, 0xE0,       /*   Usage Minimum (0xE0) */
+	0x29, 0xE7,       /*   Usage Maximum (0xE7) */
+	0x15, 0x00,       /*   Logical Minimum (0) */
+	0x25, 0x01,       /*   Logical Maximum (1) */
+	0x75, 0x01,       /*   Report Size (1) */
+	0x95, 0x08,       /*   Report Count (8) */
+	0x81, 0x02,       /*   Input (Data,Var,Abs) */
+	0x81, 0x03,       /*   Input (Const,Var,Abs) */
+	0x95, 0x05,       /*   Report Count (5) */
+	0x05, 0x08,       /*   Usage Page (LEDs) */
+	0x19, 0x01,       /*   Usage Minimum (0x01) */
+	0x29, 0x05,       /*   Usage Maximum (0x05) */
+	0x91, 0x02,       /*   Output (Data,Var,Abs) */
+	0x95, 0x01,       /*   Report Count (1) */
+	0x75, 0x03,       /*   Report Size (3) */
+	0x91, 0x01,       /*   Output (Const,Array,Abs) */
+	0x95, 0x06,       /*   Report Count (6) */
+	0x75, 0x08,       /*   Report Size (8) */
+	0x15, 0x00,       /*   Logical Minimum (0) */
+	0x26, 0xA4, 0x00, /*   Logical Maximum (164) */
+	0x05, 0x07,       /*   Usage Page (Keyboard/Keypad) */
+	0x19, 0x00,       /*   Usage Minimum (0x00) */
+	0x2A, 0xA4, 0x00, /*   Usage Maximum (0xA4) */
+	0x81, 0x00,       /*   Input (Data,Array,Abs) */
+	0xC0,             /* End Collection */
+	0x05, 0x0C,       /* Usage Page (Consumer) */
+	0x09, 0x01,       /* Usage (Consumer Control) */
+	0xA1, 0x01,       /* Collection (Application) */
+	0x85, 0x06,       /*   Report ID (6) */
+	0x15, 0x00,       /*   Logical Minimum (0) */
+	0x26, 0x80, 0x03, /*   Logical Maximum (896) */
+	0x19, 0x00,       /*   Usage Minimum (0x00) */
+	0x2A, 0x80, 0x03, /*   Usage Maximum (0x380) */
+	0x75, 0x10,       /*   Report Size (16) */
+	0x95, 0x01,       /*   Report Count (1) */
+	0x81, 0x00,       /*   Input (Data,Array,Abs) */
+	0xC0,             /* End Collection */
+	0x05, 0x01,       /* Usage Page (Generic Desktop) */
+	0x09, 0x02,       /* Usage (Mouse) */
+	0xA1, 0x01,       /* Collection (Application) */
+	0x85, 0x02,       /*   Report ID (2) */
+	0x09, 0x01,       /*   Usage (Pointer) */
+	0xA1, 0x00,       /*   Collection (Physical) */
+	0x05, 0x09,       /*     Usage Page (Button) */
+	0x19, 0x01,       /*     Usage Minimum (0x01) */
+	0x29, 0x05,       /*     Usage Maximum (0x05) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x25, 0x01,       /*     Logical Maximum (1) */
+	0x95, 0x05,       /*     Report Count (5) */
+	0x75, 0x01,       /*     Report Size (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x75, 0x03,       /*     Report Size (3) */
+	0x81, 0x01,       /*     Input (Const,Array,Abs) */
+	0x05, 0x01,       /*     Usage Page (Generic Desktop) */
+	0x09, 0x30,       /*     Usage (X) */
+	0x09, 0x31,       /*     Usage (Y) */
+	0x09, 0x38,       /*     Usage (Wheel) */
+	0x16, 0x00, 0x80, /*     Logical Minimum (-32768) */
+	0x26, 0xFF, 0x7F, /*     Logical Maximum (32767) */
+	0x75, 0x10,       /*     Report Size (16) */
+	0x95, 0x03,       /*     Report Count (3) */
+	0x81, 0x06,       /*     Input (Data,Var,Rel) */
+	0xC0,             /*   End Collection */
+	0xC0,             /* End Collection */
+};
+
+/* Touchpad of the Pad 8 Pro cover: three contacts with pressure. */
+static const u8 piano_touchpad_descriptor[] = {
+	0x05, 0x0D,       /* Usage Page (Digitizer) */
+	0x09, 0x05,       /* Usage (Touch Pad) */
+	0xA1, 0x01,       /* Collection (Application) */
+	0x85, 0x19,       /*   Report ID (25) */
+	0x15, 0x00,       /*   Logical Minimum (0) */
+	0x25, 0x01,       /*   Logical Maximum (1) */
+	0x35, 0x00,       /*   Physical Minimum (0) */
+	0x45, 0x01,       /*   Physical Maximum (1) */
+	0x75, 0x01,       /*   Report Size (1) */
+	0x95, 0x02,       /*   Report Count (2) */
+	0x05, 0x09,       /*   Usage Page (Button) */
+	0x09, 0x01,       /*   Usage (Button 1) */
+	0x09, 0x02,       /*   Usage (Button 2) */
+	0x81, 0x02,       /*   Input (Data,Var,Abs) */
+	0x95, 0x06,       /*   Report Count (6) */
+	0x81, 0x01,       /*   Input (Const,Array,Abs) */
+	0x05, 0x0D,       /*   Usage Page (Digitizer) */
+	0x09, 0x22,       /*   Usage (Finger) */
+	0xA1, 0x02,       /*   Collection (Logical) */
+	0x09, 0x42,       /*     Usage (Tip Switch) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x25, 0x01,       /*     Logical Maximum (1) */
+	0x75, 0x01,       /*     Report Size (1) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x09, 0x32,       /*     Usage (In Range) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x09, 0x47,       /*     Usage (Confidence) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x95, 0x05,       /*     Report Count (5) */
+	0x81, 0x03,       /*     Input (Const,Var,Abs) */
+	0x75, 0x08,       /*     Report Size (8) */
+	0x09, 0x51,       /*     Usage (Contact Identifier) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x26, 0xFF, 0xFF, /*     Logical Maximum (65535) */
+	0x75, 0x10,       /*     Report Size (16) */
+	0x09, 0x30,       /*     Usage (Tip Pressure) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x05, 0x01,       /*     Usage Page (Generic Desktop) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x26, 0x7F, 0x0C, /*     Logical Maximum (3199) */
+	0x75, 0x10,       /*     Report Size (16) */
+	0x55, 0x0F,       /*     Unit Exponent (-1) */
+	0x65, 0x11,       /*     Unit (0x11) */
+	0x09, 0x30,       /*     Usage (X) */
+	0x35, 0x00,       /*     Physical Minimum (0) */
+	0x46, 0x5E, 0x00, /*     Physical Maximum (94) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x09, 0x31,       /*     Usage (Y) */
+	0x26, 0x57, 0x08, /*     Logical Maximum (2135) */
+	0x46, 0x2A, 0x00, /*     Physical Maximum (42) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0xC0,             /*   End Collection */
+	0xA1, 0x02,       /*   Collection (Logical) */
+	0x05, 0x0D,       /*     Usage Page (Digitizer) */
+	0x09, 0x42,       /*     Usage (Tip Switch) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x25, 0x01,       /*     Logical Maximum (1) */
+	0x75, 0x01,       /*     Report Size (1) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x09, 0x32,       /*     Usage (In Range) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x09, 0x47,       /*     Usage (Confidence) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x95, 0x05,       /*     Report Count (5) */
+	0x81, 0x03,       /*     Input (Const,Var,Abs) */
+	0x75, 0x08,       /*     Report Size (8) */
+	0x09, 0x51,       /*     Usage (Contact Identifier) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x26, 0xFF, 0xFF, /*     Logical Maximum (65535) */
+	0x75, 0x10,       /*     Report Size (16) */
+	0x09, 0x30,       /*     Usage (Tip Pressure) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x05, 0x01,       /*     Usage Page (Generic Desktop) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x26, 0x7F, 0x0C, /*     Logical Maximum (3199) */
+	0x75, 0x10,       /*     Report Size (16) */
+	0x55, 0x0F,       /*     Unit Exponent (-1) */
+	0x65, 0x11,       /*     Unit (0x11) */
+	0x09, 0x30,       /*     Usage (X) */
+	0x35, 0x00,       /*     Physical Minimum (0) */
+	0x46, 0x5E, 0x00, /*     Physical Maximum (94) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x09, 0x31,       /*     Usage (Y) */
+	0x26, 0x57, 0x08, /*     Logical Maximum (2135) */
+	0x46, 0x2A, 0x00, /*     Physical Maximum (42) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0xC0,             /*   End Collection */
+	0xA1, 0x02,       /*   Collection (Logical) */
+	0x05, 0x0D,       /*     Usage Page (Digitizer) */
+	0x09, 0x42,       /*     Usage (Tip Switch) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x25, 0x01,       /*     Logical Maximum (1) */
+	0x75, 0x01,       /*     Report Size (1) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x09, 0x32,       /*     Usage (In Range) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x09, 0x47,       /*     Usage (Confidence) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x95, 0x05,       /*     Report Count (5) */
+	0x81, 0x03,       /*     Input (Const,Var,Abs) */
+	0x75, 0x08,       /*     Report Size (8) */
+	0x09, 0x51,       /*     Usage (Contact Identifier) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x26, 0xFF, 0xFF, /*     Logical Maximum (65535) */
+	0x75, 0x10,       /*     Report Size (16) */
+	0x09, 0x30,       /*     Usage (Tip Pressure) */
+	0x95, 0x01,       /*     Report Count (1) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x05, 0x01,       /*     Usage Page (Generic Desktop) */
+	0x15, 0x00,       /*     Logical Minimum (0) */
+	0x26, 0x7F, 0x0C, /*     Logical Maximum (3199) */
+	0x75, 0x10,       /*     Report Size (16) */
+	0x55, 0x0F,       /*     Unit Exponent (-1) */
+	0x65, 0x11,       /*     Unit (0x11) */
+	0x09, 0x30,       /*     Usage (X) */
+	0x35, 0x00,       /*     Physical Minimum (0) */
+	0x46, 0x5E, 0x00, /*     Physical Maximum (94) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0x09, 0x31,       /*     Usage (Y) */
+	0x26, 0x57, 0x08, /*     Logical Maximum (2135) */
+	0x46, 0x2A, 0x00, /*     Physical Maximum (42) */
+	0x81, 0x02,       /*     Input (Data,Var,Abs) */
+	0xC0,             /*   End Collection */
+	0x05, 0x0D,       /*   Usage Page (Digitizer) */
+	0x09, 0x54,       /*   Usage (Contact Count) */
+	0x95, 0x01,       /*   Report Count (1) */
+	0x75, 0x08,       /*   Report Size (8) */
+	0x15, 0x00,       /*   Logical Minimum (0) */
+	0x25, 0x08,       /*   Logical Maximum (8) */
+	0x81, 0x02,       /*   Input (Data,Var,Abs) */
+	0x09, 0x55,       /*   Usage (Contact Count Maximum) */
+	0xB1, 0x02,       /*   Feature (Data,Var,Abs) */
+	0x06, 0x00, 0xFF, /*   Usage Page (Vendor 0xFF00) */
+	0x09, 0xC5,       /*   Usage (Win8 certification blob) */
+	0x15, 0x00,       /*   Logical Minimum (0) */
+	0x26, 0xFF, 0x00, /*   Logical Maximum (255) */
+	0x75, 0x08,       /*   Report Size (8) */
+	0x96, 0x00, 0x01, /*   Report Count (256) */
+	0xB1, 0x02,       /*   Feature (Data,Var,Abs) */
+	0xC0,             /* End Collection */
+};
+
 static int nanosic_wn8030_hid_parse(struct hid_device *hid)
 {
 	struct nanosic_wn8030 *nanosic = hid->driver_data;
@@ -1786,7 +2015,29 @@ static const struct nanosic_wn8030_variant nanosic_wn8030_sheng = {
 	.boot_ms = 20, /* On Pad 6S Pro we only wait for WN8030 bootrom start */
 };
 
+/*
+ * Xiaomi Pad 8 Pro: reports come packed in one read frame, runtime commands
+ * are addressed with the device address byte, and the MCU gets a reset
+ * pulse and half a second for its bootrom before it is woken up.
+ */
+static const struct nanosic_wn8030_variant nanosic_wn8030_piano = {
+	.kbd_rdesc = piano_keyboard_descriptor,
+	.kbd_rsize = sizeof(piano_keyboard_descriptor),
+	.tp_rdesc = piano_touchpad_descriptor,
+	.tp_rsize = sizeof(piano_touchpad_descriptor),
+	.cmd_reg = 0x4c,
+	.consumer_len = 5,
+	.touchpad_len = 27,
+	.caps_led_mask = BIT(1),
+	.packed_reports = true,
+	.reset_ms = 2,
+	.boot_ms = 500,
+	.wake_ms = 50,
+	.bl_write_ms = 3,
+};
+
 static const struct of_device_id __maybe_unused nanosic_wn8030_of_match[] = {
+	{ .compatible = "nanosic,wn8030-piano", .data = &nanosic_wn8030_piano },
 	{ .compatible = "nanosic,wn8030-sheng", .data = &nanosic_wn8030_sheng },
 	{ },
 };
