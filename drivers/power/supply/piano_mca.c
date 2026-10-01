@@ -187,6 +187,14 @@ MODULE_PARM_DESC(charge_current,
 #define MCA_HV_SETTLE_POLLS	3
 /* A source that drops the bus while 9 V is pending is left alone this long */
 #define MCA_HV_RETRY_MS		60000
+/*
+ * A source that goes back to 5 V by itself once 9 V was reached (a Xiaomi
+ * charger does after the adapter authentication) is asked again after a
+ * pause, a few times per attach.
+ */
+#define MCA_HV_VBUS_5V_MAX_UV	6000000
+#define MCA_HV_RENEG_MS		10000
+#define MCA_HV_RENEG_MAX	3
 
 static bool hv_charge;
 module_param(hv_charge, bool, 0444);
@@ -288,6 +296,7 @@ struct piano_mca {
 	unsigned long fcc_raise_at;	/* jiffies before which it is not raised */
 	enum piano_mca_hv hv;
 	int hv_polls;
+	int hv_renegs;		/* times the source went back to 5 V on its own */
 	unsigned long hv_retry;	/* jiffies before which 9 V is not asked for */
 	struct pmic_glink_client *pan_client;
 	struct work_struct pan_work;
@@ -340,6 +349,7 @@ static void piano_mca_pdr_notify(void *priv, int state)
 	mca->icl_set_ma = 0;
 	mca->fcc_set_ma = 0;
 	mca->hv = MCA_HV_OFF;
+	mca->hv_renegs = 0;
 	mod_delayed_work(system_percpu_wq, &mca->poll, 0);
 }
 
@@ -755,6 +765,7 @@ static u32 piano_mca_hv_step(struct piano_mca *mca)
 	bool vbus_hv = mca->vbus_uv >= MCA_HV_VBUS_MIN_UV &&
 		       mca->vbus_uv <= MCA_HV_VBUS_MAX_UV;
 	u32 ma = 0;
+	int ret;
 
 	if (!hv_charge || mca->hv == MCA_HV_BLOCKED)
 		return 0;
@@ -768,8 +779,12 @@ static u32 piano_mca_hv_step(struct piano_mca *mca)
 		if (!ma || time_before(jiffies, mca->hv_retry) ||
 		    piano_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
 			return 0;
-		if (piano_mca_write_u32(mca, MCA_PROP_PD_FIXED_VOLT, MCA_HV_MV))
+		ret = piano_mca_write_u32(mca, MCA_PROP_PD_FIXED_VOLT, MCA_HV_MV);
+		if (ret) {
+			dev_warn(mca->dev, "9 V request refused: %d (adsp %d)\n",
+				 ret, mca->retcode);
 			break;
+		}
 		dev_info(mca->dev, "requested 9 V (PDO %u mA)\n", ma);
 		mca->hv = MCA_HV_REQUESTED;
 		mca->hv_polls = 0;
@@ -786,6 +801,14 @@ static u32 piano_mca_hv_step(struct piano_mca *mca)
 	case MCA_HV_ON:
 		if (ma && vbus_hv)
 			return ma;
+		if (ma && mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV &&
+		    mca->hv_renegs++ < MCA_HV_RENEG_MAX) {
+			dev_info(mca->dev, "source back at 5 V, asking again in %u s\n",
+				 MCA_HV_RENEG_MS / 1000);
+			mca->hv = MCA_HV_OFF;
+			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS);
+			return 0;
+		}
 		break;
 	default:
 		return 0;
@@ -869,6 +892,7 @@ static void piano_mca_poll(struct work_struct *work)
 		if (mca->hv == MCA_HV_REQUESTED)
 			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RETRY_MS);
 		mca->hv = MCA_HV_OFF;
+		mca->hv_renegs = 0;
 	} else if (charge_policy) {
 		piano_mca_apply_policy(mca);
 	}
