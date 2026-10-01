@@ -168,7 +168,7 @@ static void piano_mca_callback(const void *data, size_t len, void *priv)
 		/* notification: id at +0xc, payload from +0x10 */
 		dev_dbg(mca->dev, "notify %#x len %zu\n",
 			le32_to_cpu(resp->property), len);
-		mod_delayed_work(system_wq, &mca->poll, 0);
+		mod_delayed_work(system_percpu_wq, &mca->poll, 0);
 		return;
 	}
 
@@ -196,7 +196,7 @@ static void piano_mca_pdr_notify(void *priv, int state)
 	mca->service_up = state == SERVREG_SERVICE_STATE_UP;
 	/* A restarted ADSP is back on its defaults */
 	mca->icl_set_ma = 0;
-	mod_delayed_work(system_wq, &mca->poll, 0);
+	mod_delayed_work(system_percpu_wq, &mca->poll, 0);
 }
 
 /*
