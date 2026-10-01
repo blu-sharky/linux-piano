@@ -14,8 +14,11 @@
  * Property ids are 32 bits wide; bits 31:16 select a class (0: charger and
  * battery, 1: wireless, 2: USB and PD).
  *
- * This driver replaces qcom_battmgr on this board.  Only reads are issued:
- * charging limits stay with the ADSP firmware defaults.  The battery itself
+ * This driver replaces qcom_battmgr on this board.  By default only reads
+ * are issued and charging limits stay with the ADSP firmware defaults (float
+ * voltage 4350 mV, charge current 3000 mA, JEITA window 0-55 degC).  With
+ * charge_policy=1 it raises the input current limit by charger type, the
+ * only property it ever writes (see piano_mca_write_u32()).  The battery itself
  * is reported by the two bq27z561 fuel gauges; this driver adds the USB
  * input (presence from the bus voltage, bus current, input current limit and
  * the charger type detected by the ADSP).
@@ -34,9 +37,11 @@
 
 #define MCA_DATA_LEN		256
 #define MCA_OP_READ		1
+#define MCA_OP_WRITE		2
 
 /* Property ids recovered from the stock charger stack */
 #define MCA_PROP_ICL		0x2008	/* input current limit, mA */
+#define MCA_PROP_PACK_TBAT	0x202a	/* degC */
 #define MCA_PROP_BUS_VOLT	0x20002	/* uV */
 #define MCA_PROP_BUS_CURR	0x20004	/* uA */
 #define MCA_PROP_REAL_TYPE	0x2000c	/* enum mca_real_type */
@@ -99,6 +104,19 @@ static const char * const mca_real_type_names[MCA_TYPE_MAX] = {
 #define MCA_VBUS_ONLINE_UV	4000000
 #define MCA_POLL_MS		3000
 
+/* Input current limits (mA) set by charge_policy, from the stock tables */
+#define MCA_ICL_MIN_MA		100	/* also the ADSP power-on value */
+#define MCA_ICL_MAX_MA		1500
+#define MCA_ICL_DEFAULT_MA	500
+/* Battery temperature window (degC) outside which the limit is not raised */
+#define MCA_POLICY_TBAT_MIN	15
+#define MCA_POLICY_TBAT_MAX	45
+
+static bool charge_policy;
+module_param(charge_policy, bool, 0444);
+MODULE_PARM_DESC(charge_policy,
+		 "Raise the USB input current limit by charger type (default: off, ADSP defaults)");
+
 struct mca_req {
 	__le32 owner;
 	__le32 type;
@@ -134,6 +152,7 @@ struct piano_mca {
 	int ibus_ua;
 	int icl_ma;
 	u32 real_type;
+	int icl_set_ma;		/* last limit written by charge_policy, 0 if none */
 	struct dentry *dbg;
 	u32 dbg_prop;
 	u8 dbg_data[MCA_DATA_LEN];
@@ -175,22 +194,30 @@ static void piano_mca_pdr_notify(void *priv, int state)
 	struct piano_mca *mca = priv;
 
 	mca->service_up = state == SERVREG_SERVICE_STATE_UP;
+	/* A restarted ADSP is back on its defaults */
+	mca->icl_set_ma = 0;
 	mod_delayed_work(system_wq, &mca->poll, 0);
 }
 
-/* Read a property; up to 256 bytes are copied to @buf. */
-static int piano_mca_read(struct piano_mca *mca, u32 prop, void *buf, size_t len)
+/*
+ * One request/response exchange.  A read copies up to 256 bytes of the reply
+ * to @buf; a write sends @len bytes of @buf.
+ */
+static int piano_mca_xfer(struct piano_mca *mca, u32 opcode, u32 prop,
+			  void *buf, size_t len)
 {
 	struct mca_req req = {
 		.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
 		.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
-		.opcode = cpu_to_le32(MCA_OP_READ),
+		.opcode = cpu_to_le32(opcode),
 		.property = cpu_to_le32(prop),
 	};
 	int ret;
 
 	if (len > MCA_DATA_LEN)
 		return -EINVAL;
+	if (opcode == MCA_OP_WRITE)
+		memcpy(req.data, buf, len);
 
 	mutex_lock(&mca->lock);
 	if (!mca->service_up) {
@@ -213,11 +240,38 @@ static int piano_mca_read(struct piano_mca *mca, u32 prop, void *buf, size_t len
 	}
 
 	ret = mca->retcode ? -EIO : 0;
-	if (!ret)
+	if (!ret && opcode == MCA_OP_READ)
 		memcpy(buf, mca->data, len);
 out:
 	mutex_unlock(&mca->lock);
 	return ret;
+}
+
+/* Read a property; up to 256 bytes are copied to @buf. */
+static int piano_mca_read(struct piano_mca *mca, u32 prop, void *buf, size_t len)
+{
+	return piano_mca_xfer(mca, MCA_OP_READ, prop, buf, len);
+}
+
+/*
+ * The only write path.  Every property it accepts is listed here with its
+ * allowed range; anything else (float voltage, charge current, ship mode,
+ * boost, ...) is refused, whatever the caller.
+ */
+static int piano_mca_write_u32(struct piano_mca *mca, u32 prop, u32 val)
+{
+	__le32 data = cpu_to_le32(val);
+
+	switch (prop) {
+	case MCA_PROP_ICL:
+		if (val < MCA_ICL_MIN_MA || val > MCA_ICL_MAX_MA)
+			return -ERANGE;
+		break;
+	default:
+		return -EPERM;
+	}
+
+	return piano_mca_xfer(mca, MCA_OP_WRITE, prop, &data, sizeof(data));
 }
 
 static u32 piano_mca_read_u32(struct piano_mca *mca, u32 prop)
@@ -228,6 +282,104 @@ static u32 piano_mca_read_u32(struct piano_mca *mca, u32 prop)
 		return 0;
 
 	return le32_to_cpu(val);
+}
+
+static const char *piano_mca_type_name(u32 type)
+{
+	return type < MCA_TYPE_MAX ? mca_real_type_names[type] : NULL;
+}
+
+static u32 piano_mca_policy_icl(u32 real_type)
+{
+	switch (real_type) {
+	case MCA_TYPE_CDP:
+		return 900;
+	/* QC and PD sources stay at 5 V, so they count as DCPs here */
+	case MCA_TYPE_DCP:
+	case MCA_TYPE_DCP_B:
+	case MCA_TYPE_HVDCP:
+	case MCA_TYPE_HVDCP_3:
+	case MCA_TYPE_HVDCP_3_B:
+	case MCA_TYPE_HVDCP_3P5:
+	case MCA_TYPE_PD:
+	case MCA_TYPE_PD_VERIFY:
+	case MCA_TYPE_PD_PPS:
+		return 1500;
+	default:
+		return MCA_ICL_DEFAULT_MA;
+	}
+}
+
+/*
+ * Current a PD source offers at 5 V: the lowest maximum among the PDOs and
+ * APDOs whose range covers 5 V (some PPS sources list only a 5-11 V APDO),
+ * or the default if there is none.
+ */
+static u32 piano_mca_pd_5v_ma(struct piano_mca *mca)
+{
+	struct piano_mca_pdo pdos[MCA_PD_MAX_PDOS];
+	u32 ma = U32_MAX;
+	int i;
+
+	if (piano_mca_read(mca, MCA_PROP_PDOS, pdos, sizeof(pdos)))
+		return MCA_ICL_DEFAULT_MA;
+
+	for (i = 0; i < MCA_PD_MAX_PDOS; i++) {
+		if (le32_to_cpu(pdos[i].min_mv) <= 5000 &&
+		    le32_to_cpu(pdos[i].max_mv) >= 5000)
+			ma = min(ma, le32_to_cpu(pdos[i].max_ma));
+	}
+
+	return ma && ma != U32_MAX ? ma : MCA_ICL_DEFAULT_MA;
+}
+
+/*
+ * The ADSP keeps the last limit written for the next source, so put its
+ * power-on value back on detach and unbind.  Retried by the next poll if
+ * the write fails.
+ */
+static void piano_mca_reset_icl(struct piano_mca *mca)
+{
+	if (!piano_mca_write_u32(mca, MCA_PROP_ICL, MCA_ICL_MIN_MA))
+		mca->icl_set_ma = 0;
+}
+
+/*
+ * charge_policy: raise the input current limit to what the detected charger
+ * type allows, never above what a PD source advertises at 5 V, and only
+ * within the battery temperature window.  Voltage, charge current and JEITA
+ * stay with the ADSP, and its AICL still backs the limit off if the source
+ * sags.
+ */
+static void piano_mca_apply_policy(struct piano_mca *mca)
+{
+	u32 target = piano_mca_policy_icl(mca->real_type);
+	int tbat = (s32)piano_mca_read_u32(mca, MCA_PROP_PACK_TBAT);
+	int ret;
+
+	switch (mca->real_type) {
+	case MCA_TYPE_PD:
+	case MCA_TYPE_PD_VERIFY:
+	case MCA_TYPE_PD_PPS:
+		target = clamp(piano_mca_pd_5v_ma(mca), MCA_ICL_MIN_MA, target);
+		break;
+	}
+	if (tbat < MCA_POLICY_TBAT_MIN || tbat > MCA_POLICY_TBAT_MAX)
+		target = MCA_ICL_DEFAULT_MA;
+
+	if (target == mca->icl_set_ma)
+		return;
+
+	ret = piano_mca_write_u32(mca, MCA_PROP_ICL, target);
+	if (ret) {
+		dev_warn(mca->dev, "failed to set input limit %u mA: %d\n",
+			 target, ret);
+		return;
+	}
+
+	dev_info(mca->dev, "%s: input limit %u mA (battery %d degC)\n",
+		 piano_mca_type_name(mca->real_type) ?: "Unknown", target, tbat);
+	mca->icl_set_ma = target;
 }
 
 static void piano_mca_poll(struct work_struct *work)
@@ -252,6 +404,13 @@ static void piano_mca_poll(struct work_struct *work)
 	changed = online != mca->online || real_type != mca->real_type;
 	mca->online = online;
 	mca->real_type = real_type;
+
+	if (!online) {
+		if (mca->icl_set_ma)
+			piano_mca_reset_icl(mca);
+	} else if (charge_policy) {
+		piano_mca_apply_policy(mca);
+	}
 	if (changed)
 		power_supply_changed(mca->usb);
 
@@ -347,7 +506,7 @@ static ssize_t charger_type_show(struct device *dev,
 {
 	struct piano_mca *mca = power_supply_get_drvdata(to_power_supply(dev));
 	u32 type = mca->online ? mca->real_type : MCA_TYPE_UNKNOWN;
-	const char *name = type < MCA_TYPE_MAX ? mca_real_type_names[type] : NULL;
+	const char *name = piano_mca_type_name(type);
 
 	if (!name)
 		return sysfs_emit(buf, "Unknown (%u)\n", type);
@@ -365,9 +524,13 @@ ATTRIBUTE_GROUPS(piano_mca_usb);
 /* The gauges re-read their status as soon as the input changes */
 static char *piano_mca_supplied_to[] = { "bq27z561-0", "bq27z561-1" };
 
-static void piano_mca_cancel_poll(void *data)
+static void piano_mca_stop(void *data)
 {
-	cancel_delayed_work_sync(data);
+	struct piano_mca *mca = data;
+
+	cancel_delayed_work_sync(&mca->poll);
+	if (mca->icl_set_ma && mca->service_up)
+		piano_mca_reset_icl(mca);
 }
 
 /* debugfs: write a property id to "prop", read the raw reply from "data" */
@@ -537,7 +700,7 @@ static int piano_mca_probe(struct auxiliary_device *adev,
 	if (IS_ERR(mca->usb))
 		return PTR_ERR(mca->usb);
 
-	ret = devm_add_action_or_reset(dev, piano_mca_cancel_poll, &mca->poll);
+	ret = devm_add_action_or_reset(dev, piano_mca_stop, mca);
 	if (ret)
 		return ret;
 
