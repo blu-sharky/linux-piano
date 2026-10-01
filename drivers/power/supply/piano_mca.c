@@ -11,9 +11,14 @@
  *              data[256] }
  *   response { owner, type = 1, opcode, property, retcode, seq, data[256] }
  *
- * This driver replaces qcom_battmgr on this board.  Only reads are issued.
- * The battery itself is reported by the two bq27z561 fuel gauges; this driver
- * adds the USB input, polled from the bus voltage of the sub-PMIC ADC.
+ * Property ids are 32 bits wide; bits 31:16 select a class (0: charger and
+ * battery, 1: wireless, 2: USB and PD).
+ *
+ * This driver replaces qcom_battmgr on this board.  Only reads are issued:
+ * charging limits stay with the ADSP firmware defaults.  The battery itself
+ * is reported by the two bq27z561 fuel gauges; this driver adds the USB
+ * input (presence from the bus voltage, bus current, input current limit and
+ * the charger type detected by the ADSP).
  */
 
 #include <linux/auxiliary_bus.h>
@@ -22,6 +27,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/power_supply.h>
+#include <linux/seq_file.h>
 #include <linux/workqueue.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
@@ -30,15 +36,64 @@
 #define MCA_OP_READ		1
 
 /* Property ids recovered from the stock charger stack */
-#define MCA_PROP_USB_TYPE_A	0x0001
-#define MCA_PROP_BUS_CURR	0x0004
-#define MCA_PROP_USB_TYPE	0x000c
-#define MCA_PROP_CHG_STATUS	0x2001
-#define MCA_PROP_CHG_TYPE	0x2002
-#define MCA_PROP_PACK_VBAT	0x2026
-#define MCA_PROP_PACK_IBAT	0x2027
-#define MCA_PROP_PACK_TBAT	0x202a
+#define MCA_PROP_ICL		0x2008	/* input current limit, mA */
 #define MCA_PROP_BUS_VOLT	0x20002	/* uV */
+#define MCA_PROP_BUS_CURR	0x20004	/* uA */
+#define MCA_PROP_REAL_TYPE	0x2000c	/* enum mca_real_type */
+
+/* Up to seven source PDOs, as decoded by the ADSP */
+#define MCA_PROP_PDOS		0x21011	/* struct piano_mca_pdo[] */
+#define MCA_PD_MAX_PDOS		7
+
+struct piano_mca_pdo {
+	__le32 min_mv;
+	__le32 max_mv;
+	__le32 max_ma;
+};
+
+/*
+ * Charger types as named by the stock sysfs "real_type" table; 13 and 16
+ * are unnamed there, 17-19 are wireless.
+ */
+enum mca_real_type {
+	MCA_TYPE_UNKNOWN,
+	MCA_TYPE_SDP,
+	MCA_TYPE_CDP,
+	MCA_TYPE_DCP,
+	MCA_TYPE_FLOAT,
+	MCA_TYPE_HVDCP,
+	MCA_TYPE_HVDCP_3,
+	MCA_TYPE_HVDCP_3_B,
+	MCA_TYPE_HVDCP_3P5,
+	MCA_TYPE_C,
+	MCA_TYPE_PD,
+	MCA_TYPE_PD_VERIFY,
+	MCA_TYPE_PD_PPS,
+	MCA_TYPE_ACA = 14,
+	MCA_TYPE_DCP_B,
+	MCA_TYPE_MAX = 20,
+};
+
+static const char * const mca_real_type_names[MCA_TYPE_MAX] = {
+	[MCA_TYPE_UNKNOWN]	= "Unknown",
+	[MCA_TYPE_SDP]		= "SDP",
+	[MCA_TYPE_CDP]		= "CDP",
+	[MCA_TYPE_DCP]		= "DCP",
+	[MCA_TYPE_FLOAT]	= "USB_FLOAT",
+	[MCA_TYPE_HVDCP]	= "HVDCP",
+	[MCA_TYPE_HVDCP_3]	= "HVDCP_3",
+	[MCA_TYPE_HVDCP_3_B]	= "HVDCP_3_B",
+	[MCA_TYPE_HVDCP_3P5]	= "HVDCP_3P5",
+	[MCA_TYPE_C]		= "C",
+	[MCA_TYPE_PD]		= "PD",
+	[MCA_TYPE_PD_VERIFY]	= "PD_PPS",
+	[MCA_TYPE_PD_PPS]	= "PD_PPS",
+	[MCA_TYPE_ACA]		= "ACA",
+	[MCA_TYPE_DCP_B]	= "DCP",
+	[17]			= "BPP",
+	[18]			= "EPP",
+	[19]			= "HPP",
+};
 
 /* VBUS above this means a source is attached (USB default is 5 V) */
 #define MCA_VBUS_ONLINE_UV	4000000
@@ -76,6 +131,9 @@ struct piano_mca {
 	struct delayed_work poll;
 	bool online;
 	int vbus_uv;
+	int ibus_ua;
+	int icl_ma;
+	u32 real_type;
 	struct dentry *dbg;
 	u32 dbg_prop;
 	u8 dbg_data[MCA_DATA_LEN];
@@ -162,24 +220,72 @@ out:
 	return ret;
 }
 
+static u32 piano_mca_read_u32(struct piano_mca *mca, u32 prop)
+{
+	__le32 val;
+
+	if (piano_mca_read(mca, prop, &val, sizeof(val)))
+		return 0;
+
+	return le32_to_cpu(val);
+}
+
 static void piano_mca_poll(struct work_struct *work)
 {
 	struct piano_mca *mca = container_of(work, struct piano_mca, poll.work);
-	__le32 vbus;
-	bool online;
+	bool online, changed;
+	u32 real_type = MCA_TYPE_UNKNOWN;
 
-	if (piano_mca_read(mca, MCA_PROP_BUS_VOLT, &vbus, sizeof(vbus)))
-		vbus = 0;
-
-	mca->vbus_uv = le32_to_cpu(vbus);
+	mca->vbus_uv = piano_mca_read_u32(mca, MCA_PROP_BUS_VOLT);
 	online = mca->vbus_uv >= MCA_VBUS_ONLINE_UV;
-	if (online != mca->online) {
-		mca->online = online;
-		power_supply_changed(mca->usb);
+
+	/* The rest only means something with a source attached */
+	if (online) {
+		mca->ibus_ua = piano_mca_read_u32(mca, MCA_PROP_BUS_CURR);
+		mca->icl_ma = piano_mca_read_u32(mca, MCA_PROP_ICL);
+		real_type = piano_mca_read_u32(mca, MCA_PROP_REAL_TYPE);
+	} else {
+		mca->ibus_ua = 0;
+		mca->icl_ma = 0;
 	}
+
+	changed = online != mca->online || real_type != mca->real_type;
+	mca->online = online;
+	mca->real_type = real_type;
+	if (changed)
+		power_supply_changed(mca->usb);
 
 	if (mca->service_up)
 		schedule_delayed_work(&mca->poll, msecs_to_jiffies(MCA_POLL_MS));
+}
+
+static enum power_supply_usb_type piano_mca_usb_type(u32 real_type)
+{
+	switch (real_type) {
+	case MCA_TYPE_SDP:
+		return POWER_SUPPLY_USB_TYPE_SDP;
+	case MCA_TYPE_CDP:
+		return POWER_SUPPLY_USB_TYPE_CDP;
+	/* QC adapters are DCPs that can be asked for a higher voltage */
+	case MCA_TYPE_DCP:
+	case MCA_TYPE_DCP_B:
+	case MCA_TYPE_HVDCP:
+	case MCA_TYPE_HVDCP_3:
+	case MCA_TYPE_HVDCP_3_B:
+	case MCA_TYPE_HVDCP_3P5:
+		return POWER_SUPPLY_USB_TYPE_DCP;
+	case MCA_TYPE_ACA:
+		return POWER_SUPPLY_USB_TYPE_ACA;
+	case MCA_TYPE_C:
+		return POWER_SUPPLY_USB_TYPE_C;
+	case MCA_TYPE_PD:
+		return POWER_SUPPLY_USB_TYPE_PD;
+	case MCA_TYPE_PD_VERIFY:
+	case MCA_TYPE_PD_PPS:
+		return POWER_SUPPLY_USB_TYPE_PD_PPS;
+	default:
+		return POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	}
 }
 
 static int piano_mca_usb_get_property(struct power_supply *psy,
@@ -195,8 +301,14 @@ static int piano_mca_usb_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
 		val->intval = mca->online ? mca->vbus_uv : 0;
 		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		val->intval = mca->ibus_ua;
+		break;
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		val->intval = mca->icl_ma * 1000;
+		break;
 	case POWER_SUPPLY_PROP_USB_TYPE:
-		val->intval = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+		val->intval = piano_mca_usb_type(mca->real_type);
 		break;
 	default:
 		return -EINVAL;
@@ -208,17 +320,47 @@ static int piano_mca_usb_get_property(struct power_supply *psy,
 static const enum power_supply_property piano_mca_usb_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	POWER_SUPPLY_PROP_USB_TYPE,
 };
 
 static const struct power_supply_desc piano_mca_usb_desc = {
 	.name = "piano-mca-usb",
 	.type = POWER_SUPPLY_TYPE_USB,
-	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
+	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
+		     BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
+		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
+		     BIT(POWER_SUPPLY_USB_TYPE_ACA) |
+		     BIT(POWER_SUPPLY_USB_TYPE_C) |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD) |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD_PPS),
 	.properties = piano_mca_usb_props,
 	.num_properties = ARRAY_SIZE(piano_mca_usb_props),
 	.get_property = piano_mca_usb_get_property,
 };
+
+/* The ADSP's own name of the charger type, finer than usb_type */
+static ssize_t charger_type_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct piano_mca *mca = power_supply_get_drvdata(to_power_supply(dev));
+	u32 type = mca->online ? mca->real_type : MCA_TYPE_UNKNOWN;
+	const char *name = type < MCA_TYPE_MAX ? mca_real_type_names[type] : NULL;
+
+	if (!name)
+		return sysfs_emit(buf, "Unknown (%u)\n", type);
+
+	return sysfs_emit(buf, "%s\n", name);
+}
+static DEVICE_ATTR_RO(charger_type);
+
+static struct attribute *piano_mca_usb_attrs[] = {
+	&dev_attr_charger_type.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(piano_mca_usb);
 
 /* The gauges re-read their status as soon as the input changes */
 static char *piano_mca_supplied_to[] = { "bq27z561-0", "bq27z561-1" };
@@ -260,6 +402,93 @@ static ssize_t piano_mca_dbg_data_read(struct file *file, char __user *ubuf,
 		      mca->dbg_prop, mca->dbg_ret, 32, mca->dbg_data);
 	return simple_read_from_buffer(ubuf, count, ppos, line, n);
 }
+
+/*
+ * Read-only properties dumped by debugfs "summary", for calibrating the
+ * charger types.  The UVDM properties are left out on purpose.
+ */
+static const struct {
+	u32 prop;
+	u8 len;
+	const char *name;
+} piano_mca_dbg_summary_props[] = {
+	{ 0x2001, 4, "chg_status" },
+	{ 0x2002, 4, "chg_type" },
+	{ 0x2006, 4, "term_curr" },
+	{ 0x2007, 4, "term_volt" },
+	{ 0x2008, 4, "input_curr_limit" },
+	{ 0x200c, 4, "vsys" },
+	{ 0x2015, 4, "aicl_cont_thd" },
+	{ 0x2026, 4, "pack_vbat" },
+	{ 0x2027, 4, "pack_ibat" },
+	{ 0x2029, 4, "aicl_status" },
+	{ 0x202a, 4, "pack_tbat" },
+	{ 0x20001, 4, "usb_type" },
+	{ 0x20002, 4, "bus_volt" },
+	{ 0x20003, 4, "usb_sns_volt" },
+	{ 0x20004, 4, "bus_curr" },
+	{ 0x2000c, 4, "real_type" },
+	{ 0x21002, 4, "verify_process" },
+	{ 0x2100c, 4, "data_role" },
+	{ 0x2100d, 4, "pd_state" },
+	{ 0x2100e, 4, "adapter_id" },
+	{ 0x2100f, 4, "adapter_svid" },
+	{ MCA_PROP_PDOS, sizeof(struct piano_mca_pdo) * MCA_PD_MAX_PDOS, "pdos" },
+	{ 0x21013, 4, "pps_max_curr" },
+	{ 0x21014, 4, "apdo_max" },
+	{ 0x21015, 4, "typec_mode" },
+	{ 0x21016, 4, "cc_orientation" },
+	{ 0x21019, 4, "pps_status" },
+	{ 0x2101e, 1, "has_dp" },
+	{ 0x21022, 4, "snk_src_mode" },
+	{ 0x21025, 4, "pps_ptf" },
+	{ 0x21026, 1, "suspend_support" },
+};
+
+static int piano_mca_dbg_summary_show(struct seq_file *s, void *unused)
+{
+	struct piano_mca *mca = s->private;
+	__le32 val[3 * MCA_PD_MAX_PDOS];
+	struct piano_mca_pdo *pdo = (void *)val;
+	int i, j, ret;
+
+	for (i = 0; i < ARRAY_SIZE(piano_mca_dbg_summary_props); i++) {
+		u32 prop = piano_mca_dbg_summary_props[i].prop;
+		u8 len = piano_mca_dbg_summary_props[i].len;
+
+		memset(val, 0, sizeof(val));
+		ret = piano_mca_read(mca, prop, val, len);
+		seq_printf(s, "%#07x %-17s", prop,
+			   piano_mca_dbg_summary_props[i].name);
+		if (ret) {
+			seq_printf(s, " error %d\n", ret);
+			continue;
+		}
+		if (prop == MCA_PROP_PDOS) {
+			/* slot:min-max mV/max mA, empty slots skipped */
+			bool any = false;
+
+			for (j = 0; j < MCA_PD_MAX_PDOS; j++) {
+				if (!pdo[j].max_mv)
+					continue;
+				seq_printf(s, " %d:%u-%u/%u", j,
+					   le32_to_cpu(pdo[j].min_mv),
+					   le32_to_cpu(pdo[j].max_mv),
+					   le32_to_cpu(pdo[j].max_ma));
+				any = true;
+			}
+			if (!any)
+				seq_puts(s, " none");
+		} else {
+			for (j = 0; j < DIV_ROUND_UP(len, 4); j++)
+				seq_printf(s, " %u", le32_to_cpu(val[j]));
+		}
+		seq_putc(s, '\n');
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(piano_mca_dbg_summary);
 
 static const struct file_operations piano_mca_dbg_prop_fops = {
 	.open = simple_open,
@@ -303,6 +532,7 @@ static int piano_mca_probe(struct auxiliary_device *adev,
 	psy_cfg.drv_data = mca;
 	psy_cfg.supplied_to = piano_mca_supplied_to;
 	psy_cfg.num_supplicants = ARRAY_SIZE(piano_mca_supplied_to);
+	psy_cfg.attr_grp = piano_mca_usb_groups;
 	mca->usb = devm_power_supply_register(dev, &piano_mca_usb_desc, &psy_cfg);
 	if (IS_ERR(mca->usb))
 		return PTR_ERR(mca->usb);
@@ -314,6 +544,8 @@ static int piano_mca_probe(struct auxiliary_device *adev,
 	mca->dbg = debugfs_create_dir("piano_mca", NULL);
 	debugfs_create_file("prop", 0200, mca->dbg, mca, &piano_mca_dbg_prop_fops);
 	debugfs_create_file("data", 0400, mca->dbg, mca, &piano_mca_dbg_data_fops);
+	debugfs_create_file("summary", 0400, mca->dbg, mca,
+			    &piano_mca_dbg_summary_fops);
 	devm_add_action_or_reset(dev, piano_mca_dbg_remove, mca->dbg);
 
 	pmic_glink_client_register(mca->client);
