@@ -301,6 +301,8 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_DROP_FORGET_MS	10000
 /* with mipps_auth, waits this long after attach for the authentication */
 #define MCA_CP_AUTH_WAIT_MS	60000
+/* an authenticated adapter resets itself within this, see piano_mca_auth_pending() */
+#define MCA_AUTH_RESET_WAIT_MS	30000
 
 static bool cp_charge;
 module_param(cp_charge, bool, 0444);
@@ -411,6 +413,8 @@ struct piano_mca {
 	u32 cp_ibus_cap;	/* learned from a source dropping out, 0 if none */
 	unsigned long cp_off_at;	/* jiffies when the source went away */
 	unsigned long cp_on_at;		/* jiffies when it came */
+	bool auth_ok;		/* xiaomi-mipps-auth reported the adapter verified */
+	unsigned long auth_at;	/* jiffies when it did */
 	unsigned long hv_retry;	/* jiffies before which 9 V is not asked for */
 	struct pmic_glink_client *pan_client;
 	struct work_struct pan_work;
@@ -920,6 +924,18 @@ static int piano_mca_request_volt(struct piano_mca *mca, u32 mv)
 }
 
 /*
+ * Once authenticated, a Xiaomi adapter stays at 5 V, refuses further PD
+ * requests and resets itself about 15 s later; it is left alone until then.
+ */
+static bool piano_mca_auth_pending(struct piano_mca *mca)
+{
+	return mipps_auth && mca->auth_ok &&
+	       !time_after(mca->cp_on_at, mca->auth_at) &&
+	       time_before(jiffies, mca->auth_at +
+				    msecs_to_jiffies(MCA_AUTH_RESET_WAIT_MS));
+}
+
+/*
  * hv_charge state machine, one step per poll.  Returns the input current
  * the source allows at 9 V once the bus is there, 0 while at 5 V.
  */
@@ -945,6 +961,7 @@ static u32 piano_mca_hv_step(struct piano_mca *mca)
 	case MCA_HV_OFF:
 		/* not in the middle of an adapter authentication */
 		if (!ma || time_before(jiffies, mca->hv_retry) ||
+		    piano_mca_auth_pending(mca) ||
 		    piano_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
 			return 0;
 		mca->hv_pps = pps;
@@ -1183,14 +1200,27 @@ static u32 piano_mca_cp_apdo(struct piano_mca *mca, u32 start_mv, u32 *max_mv)
 	return ma;
 }
 
-/* Called from the poll at 9 V on the buck charger */
+/*
+ * Direct charging after the reset that follows, from 5 V by PPS and without
+ * asking for 9 V first.
+ */
+static bool piano_mca_cp_after_auth(struct piano_mca *mca)
+{
+	return mipps_auth && mca->auth_ok &&
+	       time_after(mca->cp_on_at, mca->auth_at) &&
+	       mca->hv != MCA_HV_REQUESTED &&
+	       mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV;
+}
+
+/* Called from the poll at 9 V on the buck charger, or right after the auth */
 static void piano_mca_cp_try_start(struct piano_mca *mca)
 {
 	int vbat, ibat, tbat, tpack, ret;
 	u32 start_mv, ma, max_mv = 0;
 
 	if (!cp_charge || !hv_charge || !charge_current ||
-	    mca->cp != MCA_CP_OFF || mca->hv != MCA_HV_ON)
+	    mca->cp != MCA_CP_OFF ||
+	    (mca->hv != MCA_HV_ON && !piano_mca_cp_after_auth(mca)))
 		return;
 
 	if (piano_mca_gauges(&vbat, &ibat, &tbat))
@@ -1202,7 +1232,7 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 	    piano_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
 		return;
 	/* PD requests in the middle of the authentication break it */
-	if (mipps_auth && !piano_mca_read_u32(mca, MCA_PROP_PD_VERIFIED) &&
+	if (mipps_auth && !mca->auth_ok &&
 	    time_before(jiffies, mca->cp_on_at +
 				 msecs_to_jiffies(MCA_CP_AUTH_WAIT_MS)))
 		return;
@@ -1399,6 +1429,10 @@ static void piano_mca_poll(struct work_struct *work)
 	if (!online && mca->online)
 		mca->cp_off_at = jiffies;
 	if (online && !mca->online) {
+		/* away longer than a reset takes: another attach */
+		if (time_after(jiffies, mca->cp_off_at +
+				msecs_to_jiffies(MCA_CP_DROP_FORGET_MS)))
+			mca->auth_ok = false;
 		mca->cp_on_at = jiffies;
 		/* a voltage change under way breaks the identity exchange */
 		if (mipps_auth)
@@ -1423,8 +1457,9 @@ static void piano_mca_poll(struct work_struct *work)
 	} else if (charge_policy && piano_mca_cp_active(mca)) {
 		piano_mca_cp_step(mca);
 	} else if (charge_policy) {
-		piano_mca_apply_policy(mca);
 		piano_mca_cp_try_start(mca);
+		if (!piano_mca_cp_active(mca))
+			piano_mca_apply_policy(mca);
 	}
 	if (changed)
 		power_supply_changed(mca->usb);
@@ -1716,7 +1751,15 @@ static ssize_t pd_verifed_store(struct device *dev,
 				struct device_attribute *attr,
 				const char *buf, size_t count)
 {
-	return piano_mca_store_flag(dev, buf, count, MCA_PROP_PD_VERIFIED);
+	struct piano_mca *mca = piano_mca_from_dev(dev);
+	ssize_t ret = piano_mca_store_flag(dev, buf, count, MCA_PROP_PD_VERIFIED);
+	bool flag;
+
+	if (ret == count && !kstrtobool(buf, &flag)) {
+		mca->auth_at = jiffies;
+		mca->auth_ok = flag;
+	}
+	return ret;
 }
 static DEVICE_ATTR_RW(pd_verifed);
 
