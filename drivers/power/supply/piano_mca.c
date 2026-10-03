@@ -19,8 +19,10 @@
  * voltage 4350 mV, charge current 3000 mA, JEITA window 0-55 degC).  With
  * charge_policy=1 it raises the input current limit by charger type, with
  * charge_current=1 as well the charge current, and with hv_charge=1 it asks
- * PD and PPS sources for 9 V; with mipps_auth=1 it relays the Xiaomi charger
- * authentication (MiPPS) messages for userspace.  piano_mca_write_allowed()
+ * PD and PPS sources for 9 V, and with cp_charge=1 as well it charges
+ * through the SC8541 switched-capacitor stage from PPS sources; with
+ * mipps_auth=1 it relays the Xiaomi charger authentication (MiPPS) messages
+ * for userspace.  piano_mca_write_allowed()
  * lists every property it can write.  With pan_ack=1 it also acknowledges
  * the ADSP's USB-C port notifications.  The battery itself
  * is reported by the two bq27z561 fuel gauges; this driver adds the USB
@@ -232,6 +234,87 @@ module_param(mipps_auth, bool, 0444);
 MODULE_PARM_DESC(mipps_auth,
 		 "Expose the Xiaomi charger authentication (MiPPS) messages to userspace (default: off)");
 
+/*
+ * cp_charge: direct charging through the SC8541 2:1 switched-capacitor
+ * stage (driver sc8541_charger), which is how stock charges fast
+ * (mca_strategy_quickchg): a PPS source is held at about twice the battery
+ * voltage and the stage halves it into the battery at twice the bus
+ * current, while the buck charger is held at MCA_CP_BUCK_MA.  The sequence
+ * follows stock: ask the source for twice the battery voltage plus
+ * MCA_CP_DELTA_MV, enable the stage, raise the voltage MCA_CP_STEP_MV at a
+ * time until current flows, then regulate the voltage every MCA_CP_POLL_MS
+ * so the bus current stays at cp_ibus_max and the battery current (both
+ * gauges) below cp_ibat_max (MCA_CP_IBAT_COOL_MA below MCA_CP_TBAT_FULL
+ * degC, as stock lowers it there too).  The limits are inside stock's
+ * (8 A up to 4.15 V at 18-48 degC without FFC, 12.4 A with it, sources
+ * up to 6.1 A): direct charging only runs from MCA_CP_VBAT_MIN_MV to
+ * MCA_CP_VBAT_MAX_MV and from MCA_CP_TBAT_MIN to MCA_CP_TBAT_MAX degC (left
+ * above MCA_CP_TBAT_EXIT), and the buck charger does the rest.  Anything
+ * unexpected (a read failure, the stage turning itself off, the bus out of
+ * range, too little or too much current, detach, an ADSP restart, unbind)
+ * turns the stage off and goes back to 9 V on the buck charger until the
+ * source is detached.  The stage also turns itself off if it is not kicked
+ * for 3 s, and its bus over-current protection is set 1 A above the target.
+ */
+#define MCA_CP_POLL_MS		500
+#define MCA_CP_VBAT_MIN_MV	3500
+#define MCA_CP_VBAT_START_MV	4000	/* only starts below this */
+#define MCA_CP_VBAT_MAX_MV	4100
+#define MCA_CP_TBAT_MIN		15
+#define MCA_CP_TBAT_MAX		38	/* starts, and raises the current, below */
+#define MCA_CP_TBAT_EXIT	40
+#define MCA_CP_TDIE_MAX		800	/* 0.1 degC */
+#define MCA_CP_DELTA_MV		300	/* stock div_delta_volt */
+#define MCA_CP_STEP_MV		40	/* stock open path step */
+/*
+ * Regulation step, the PPS resolution: one step moves the bus current by
+ * about 140 mA, so it is held between the target and MCA_CP_BAND_MA below.
+ */
+#define MCA_CP_REG_STEP_MV	20
+#define MCA_CP_BAND_MA		200
+/*
+ * Above twice the battery voltage: the most the stage may see, and the most
+ * the source may be asked for (the cable drops up to about 0.8 V at 5 A)
+ */
+#define MCA_CP_VBUS_MAX_DELTA_MV 1200
+#define MCA_CP_REQ_MAX_DELTA_MV	2000
+#define MCA_CP_PPS_MIN_MV	6000
+#define MCA_CP_PPS_MAX_MV	10000
+#define MCA_CP_BUCK_MA		500	/* buck input limit and charge current */
+#define MCA_CP_PPS_MAX_MA	5000	/* current limit asked of the source */
+#define MCA_CP_TBAT_FULL	18	/* full battery current from here */
+#define MCA_CP_IBAT_COOL_MA	4000
+/* bus over-current protection of the stage, above the target */
+#define MCA_CP_BUSOCP_MARGIN_MA	1000
+#define MCA_CP_BUSOCP_MAX_MA	6000
+#define MCA_CP_OPEN_IBUS_MA	500	/* the stage counts as running above */
+#define MCA_CP_OPEN_TRIES	10
+#define MCA_CP_LOW_IBUS_MA	300	/* leaves when below for MCA_CP_LOW_POLLS */
+#define MCA_CP_TRIP_IBUS_MA	500	/* leaves at once this far above the target */
+#define MCA_CP_TRIP_IBAT_MA	1000
+#define MCA_CP_LOW_POLLS	6
+#define MCA_CP_LOG_POLLS	20
+/* see piano_mca_cp_learn_drop() */
+#define MCA_CP_DROP_BACKOFF_MA	500
+#define MCA_CP_DROP_FORGET_MS	10000
+/* with mipps_auth, waits this long after attach for the authentication */
+#define MCA_CP_AUTH_WAIT_MS	60000
+
+static bool cp_charge;
+module_param(cp_charge, bool, 0444);
+MODULE_PARM_DESC(cp_charge,
+		 "Charge through the SC8541 switched-capacitor stage from PPS sources; needs hv_charge and charge_current (default: off)");
+
+static unsigned int cp_ibus_max = 2000;
+module_param(cp_ibus_max, uint, 0444);
+MODULE_PARM_DESC(cp_ibus_max,
+		 "Bus current of the switched-capacitor stage, mA (500-4800, default 2000; at most what the source offers less 700)");
+
+static unsigned int cp_ibat_max = 5000;
+module_param(cp_ibat_max, uint, 0444);
+MODULE_PARM_DESC(cp_ibat_max,
+		 "Battery current while direct charging, both cells, mA (1000-8000, default 5000)");
+
 static bool pan_ack;
 module_param(pan_ack, bool, 0444);
 MODULE_PARM_DESC(pan_ack,
@@ -261,6 +344,13 @@ enum piano_mca_hv {
 	MCA_HV_REQUESTED,	/* 9 V asked for, waiting for the bus */
 	MCA_HV_ON,		/* bus at 9 V */
 	MCA_HV_BLOCKED,		/* back at 5 V until detach */
+};
+
+enum piano_mca_cp {
+	MCA_CP_OFF,		/* buck charging, may start */
+	MCA_CP_OPENING,		/* source asked for, stage being started */
+	MCA_CP_ON,		/* stage running */
+	MCA_CP_DONE,		/* buck charging until detach */
 };
 
 struct mca_req {
@@ -307,6 +397,18 @@ struct piano_mca {
 	int hv_renegs;		/* times the source went back to 5 V on its own */
 	bool hv_pps;		/* 9 V is asked of a PPS APDO */
 	u32 hv_pps_ma;		/* its requested current limit */
+	enum piano_mca_cp cp;
+	struct power_supply *cp_psy;	/* the stage, held while not MCA_CP_OFF */
+	u32 cp_mv;		/* voltage asked of the PPS source */
+	u32 cp_ma;		/* its current limit */
+	u32 cp_max_mv;		/* the most the source offers */
+	u32 cp_ibus_ma;		/* bus current target */
+	int cp_polls;		/* while opening: tries; then: polls */
+	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
+	u32 cp_ibus_last;	/* bus current at the last step */
+	u32 cp_ibus_cap;	/* learned from a source dropping out, 0 if none */
+	unsigned long cp_off_at;	/* jiffies when the source went away */
+	unsigned long cp_on_at;		/* jiffies when it came */
 	unsigned long hv_retry;	/* jiffies before which 9 V is not asked for */
 	struct pmic_glink_client *pan_client;
 	struct work_struct pan_work;
@@ -549,8 +651,13 @@ static bool piano_mca_pps_word_ok(u32 val)
 {
 	u32 mv = (val >> 16) * 20, ma = (val & 0xffff) * 50;
 
-	return mv == MCA_HV_MV &&
-	       ma >= MCA_HV_PPS_MIN_MA && ma <= MCA_HV_PPS_MAX_MA;
+	if (ma < MCA_HV_PPS_MIN_MA)
+		return false;
+	if (mv == MCA_HV_MV && ma <= MCA_HV_PPS_MAX_MA)
+		return true;
+
+	return cp_charge && mv >= MCA_CP_PPS_MIN_MV && mv <= MCA_CP_PPS_MAX_MV &&
+	       ma <= MCA_CP_PPS_MAX_MA;
 }
 
 static bool piano_mca_write_allowed(u32 prop, const void *data, size_t len)
@@ -932,6 +1039,337 @@ static void piano_mca_apply_policy(struct piano_mca *mca)
 	mca->icl_set_ma = target;
 }
 
+static char *piano_mca_supplied_to[] = { "bq27z561-0", "bq27z561-1" };
+
+/*
+ * Both fuel gauges: the higher cell voltage (mV) and temperature (degC) and
+ * the sum of the currents (mA, positive while charging)
+ */
+static int piano_mca_gauges(int *vbat_mv, int *ibat_ma, int *tbat)
+{
+	union power_supply_propval v, i, t;
+	struct power_supply *psy;
+	int n, ret;
+
+	*vbat_mv = 0;
+	*ibat_ma = 0;
+	*tbat = INT_MIN;
+	for (n = 0; n < ARRAY_SIZE(piano_mca_supplied_to); n++) {
+		psy = power_supply_get_by_name(piano_mca_supplied_to[n]);
+		if (!psy)
+			return -ENODEV;
+		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &v);
+		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &i);
+		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &t);
+		power_supply_put(psy);
+		if (ret)
+			return ret;
+		*vbat_mv = max(*vbat_mv, v.intval / 1000);
+		*ibat_ma += i.intval / 1000;
+		*tbat = max(*tbat, t.intval / 10);
+	}
+
+	return 0;
+}
+
+static bool piano_mca_cp_active(struct piano_mca *mca)
+{
+	return mca->cp == MCA_CP_OPENING || mca->cp == MCA_CP_ON;
+}
+
+static int piano_mca_cp_get(struct piano_mca *mca,
+			    enum power_supply_property psp, int *val)
+{
+	union power_supply_propval pv;
+	int ret;
+
+	ret = power_supply_get_property(mca->cp_psy, psp, &pv);
+	if (!ret)
+		*val = pv.intval;
+
+	return ret;
+}
+
+static int piano_mca_cp_set_online(struct piano_mca *mca, bool on)
+{
+	union power_supply_propval pv = { .intval = on };
+
+	return power_supply_set_property(mca->cp_psy, POWER_SUPPLY_PROP_ONLINE,
+					 &pv);
+}
+
+static int piano_mca_cp_set_busocp(struct piano_mca *mca, u32 ma)
+{
+	union power_supply_propval pv = { .intval = ma * 1000 };
+
+	return power_supply_set_property(mca->cp_psy,
+					 POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+					 &pv);
+}
+
+static int piano_mca_cp_request(struct piano_mca *mca, u32 mv)
+{
+	mv = clamp(rounddown(mv, 20), (u32)MCA_CP_PPS_MIN_MV,
+		   min_t(u32, mca->cp_max_mv, MCA_CP_PPS_MAX_MV));
+	if (mv == mca->cp_mv)
+		return 0;
+
+	mca->cp_mv = mv;
+	return piano_mca_write_u32(mca, MCA_PROP_PPS_SELECT,
+				   piano_mca_pps_word(mv, mca->cp_ma));
+}
+
+/*
+ * Turn the stage off and go back to the buck charger: the next poll asks
+ * the source for 9 V again and puts the buck limits back.
+ */
+static void piano_mca_cp_stop(struct piano_mca *mca, const char *why)
+{
+	if (!piano_mca_cp_active(mca))
+		return;
+
+	if (piano_mca_cp_set_online(mca, false))
+		dev_err(mca->dev, "failed to stop the switched-capacitor stage\n");
+	power_supply_put(mca->cp_psy);
+	mca->cp_psy = NULL;
+	dev_info(mca->dev, "direct charging stopped: %s\n", why);
+
+	mca->cp = MCA_CP_DONE;
+	mca->hv = MCA_HV_OFF;
+	mca->hv_retry = jiffies;
+}
+
+/*
+ * A source that drops out under direct charging (a hard reset; the request
+ * in flight may be refused first) did not take that much current, whatever
+ * it advertised: aim lower from then on, unless it is away for longer than
+ * MCA_CP_DROP_FORGET_MS (a replug).
+ */
+static void piano_mca_cp_learn_drop(struct piano_mca *mca)
+{
+	if (mca->cp != MCA_CP_ON ||
+	    mca->cp_ibus_last <= 2 * MCA_CP_DROP_BACKOFF_MA)
+		return;
+
+	mca->cp_ibus_cap = mca->cp_ibus_last - MCA_CP_DROP_BACKOFF_MA;
+	dev_warn(mca->dev, "source dropped out at %u mA of bus current, %u mA from now on\n",
+		 mca->cp_ibus_last, mca->cp_ibus_cap);
+}
+
+/* The PPS APDO direct charging can use, 0 if none */
+static u32 piano_mca_cp_apdo(struct piano_mca *mca, u32 start_mv, u32 *max_mv)
+{
+	struct piano_mca_pdo pdos[MCA_PD_MAX_PDOS];
+	u32 ma = 0;
+	int i;
+
+	if (piano_mca_read(mca, MCA_PROP_PDOS, pdos, sizeof(pdos)))
+		return 0;
+
+	for (i = 0; i < MCA_PD_MAX_PDOS; i++) {
+		u32 min_mv = le32_to_cpu(pdos[i].min_mv);
+		u32 hi_mv = le32_to_cpu(pdos[i].max_mv);
+
+		if (min_mv < hi_mv && min_mv <= start_mv &&
+		    hi_mv >= 2 * MCA_CP_VBAT_MAX_MV + MCA_CP_DELTA_MV &&
+		    le32_to_cpu(pdos[i].max_ma) > ma) {
+			ma = le32_to_cpu(pdos[i].max_ma);
+			*max_mv = hi_mv;
+		}
+	}
+
+	return ma;
+}
+
+/* Called from the poll at 9 V on the buck charger */
+static void piano_mca_cp_try_start(struct piano_mca *mca)
+{
+	int vbat, ibat, tbat, tpack, ret;
+	u32 start_mv, ma, max_mv = 0;
+
+	if (!cp_charge || !hv_charge || !charge_current ||
+	    mca->cp != MCA_CP_OFF || mca->hv != MCA_HV_ON)
+		return;
+
+	if (piano_mca_gauges(&vbat, &ibat, &tbat))
+		return;
+	tpack = (s32)piano_mca_read_u32(mca, MCA_PROP_PACK_TBAT);
+	if (vbat < MCA_CP_VBAT_MIN_MV || vbat >= MCA_CP_VBAT_START_MV ||
+	    min(tbat, tpack) < MCA_CP_TBAT_MIN ||
+	    max(tbat, tpack) >= MCA_CP_TBAT_MAX ||
+	    piano_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
+		return;
+	/* PD requests in the middle of the authentication break it */
+	if (mipps_auth && !piano_mca_read_u32(mca, MCA_PROP_PD_VERIFIED) &&
+	    time_before(jiffies, mca->cp_on_at +
+				 msecs_to_jiffies(MCA_CP_AUTH_WAIT_MS)))
+		return;
+
+	start_mv = 2 * vbat + MCA_CP_DELTA_MV;
+	ma = piano_mca_cp_apdo(mca, start_mv, &max_mv);
+	if (ma < MCA_CP_BUCK_MA + 1000)
+		return;
+
+	mca->cp_ma = min_t(u32, ma, MCA_CP_PPS_MAX_MA);
+	mca->cp_max_mv = max_mv;
+	mca->cp_ibus_ma = min(clamp(cp_ibus_max, 500U, 4800U),
+			      mca->cp_ma - MCA_CP_BUCK_MA - 200);
+	if (mca->cp_ibus_cap)
+		mca->cp_ibus_ma = min(mca->cp_ibus_ma, mca->cp_ibus_cap);
+	if (mca->cp_ibus_ma < 2 * MCA_CP_OPEN_IBUS_MA) {
+		mca->cp = MCA_CP_DONE;
+		return;
+	}
+
+	mca->cp_psy = power_supply_get_by_name("sc8541");
+	if (!mca->cp_psy)
+		return;
+	/* it must be off before the source is asked for anything */
+	if (piano_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &ret) || ret ||
+	    piano_mca_cp_set_busocp(mca, min(mca->cp_ibus_ma + MCA_CP_BUSOCP_MARGIN_MA,
+					     MCA_CP_BUSOCP_MAX_MA))) {
+		dev_warn(mca->dev, "switched-capacitor stage not ready\n");
+		power_supply_put(mca->cp_psy);
+		mca->cp_psy = NULL;
+		mca->cp = MCA_CP_DONE;
+		return;
+	}
+
+	mca->cp_mv = 0;
+	mca->cp_polls = 0;
+	mca->cp_low = 0;
+	mca->cp = MCA_CP_OPENING;
+
+	/* the buck charger carries little meanwhile */
+	ret = piano_mca_write_u32(mca, MCA_PROP_ICL, MCA_CP_BUCK_MA);
+	ret = ret ?: piano_mca_write_u32(mca, MCA_PROP_FCC, MCA_CP_BUCK_MA);
+	if (!ret) {
+		mca->icl_set_ma = MCA_CP_BUCK_MA;
+		mca->fcc_set_ma = MCA_CP_BUCK_MA;
+	}
+	ret = ret ?: piano_mca_cp_request(mca, start_mv);
+	if (ret) {
+		piano_mca_cp_stop(mca, "start refused");
+		return;
+	}
+
+	dev_info(mca->dev, "direct charging: %u mV %u mA (APDO to %u mV %u mA), battery %d mV %d degC, bus target %u mA\n",
+		 mca->cp_mv, mca->cp_ma, max_mv, ma, vbat, tbat, mca->cp_ibus_ma);
+}
+
+/* One step of direct charging, every MCA_CP_POLL_MS */
+static void piano_mca_cp_step(struct piano_mca *mca)
+{
+	int vbat, ibat, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibat_max;
+	u32 mv = mca->cp_mv;
+
+	if (piano_mca_gauges(&vbat, &ibat, &tbat) ||
+	    piano_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &on)) {
+		piano_mca_cp_stop(mca, "read failed");
+		return;
+	}
+	tpack = (s32)piano_mca_read_u32(mca, MCA_PROP_PACK_TBAT);
+
+	if (vbat >= MCA_CP_VBAT_MAX_MV) {
+		piano_mca_cp_stop(mca, "battery voltage reached");
+		return;
+	}
+	if (min(tbat, tpack) < MCA_CP_TBAT_MIN ||
+	    max(tbat, tpack) > MCA_CP_TBAT_EXIT) {
+		piano_mca_cp_stop(mca, "battery temperature");
+		return;
+	}
+	if (piano_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS)) {
+		piano_mca_cp_stop(mca, "adapter authentication");
+		return;
+	}
+
+	ibat_max = clamp(cp_ibat_max, 1000U, 8000U);
+	if (min(tbat, tpack) < MCA_CP_TBAT_FULL)
+		ibat_max = min(ibat_max, MCA_CP_IBAT_COOL_MA);
+
+	if (mca->cp == MCA_CP_OPENING &&
+	    ++mca->cp_polls > MCA_CP_OPEN_TRIES) {
+		piano_mca_cp_stop(mca, "no current");
+		return;
+	}
+	if (!on && mca->cp == MCA_CP_ON) {
+		piano_mca_cp_stop(mca, "stage turned itself off");
+		return;
+	}
+	/* enables it while opening (then steps up next poll), else a kick */
+	if (piano_mca_cp_set_online(mca, true)) {
+		piano_mca_cp_stop(mca, "stage refused");
+		return;
+	}
+	if (!on)
+		return;
+
+	if (piano_mca_cp_get(mca, POWER_SUPPLY_PROP_VOLTAGE_NOW, &vbus_uv) ||
+	    piano_mca_cp_get(mca, POWER_SUPPLY_PROP_CURRENT_NOW, &ibus_ua) ||
+	    piano_mca_cp_get(mca, POWER_SUPPLY_PROP_TEMP, &tdie)) {
+		piano_mca_cp_stop(mca, "stage read failed");
+		return;
+	}
+	mca->cp_ibus_last = max(ibus_ua, 0) / 1000;
+	if (vbus_uv / 1000 > 2 * vbat + MCA_CP_VBUS_MAX_DELTA_MV) {
+		piano_mca_cp_stop(mca, "bus voltage too high");
+		return;
+	}
+	if (tdie > MCA_CP_TDIE_MAX) {
+		piano_mca_cp_stop(mca, "stage temperature");
+		return;
+	}
+	if (ibus_ua / 1000 > mca->cp_ibus_ma + MCA_CP_TRIP_IBUS_MA) {
+		piano_mca_cp_stop(mca, "bus current too high");
+		return;
+	}
+	if (ibat > ibat_max + MCA_CP_TRIP_IBAT_MA) {
+		piano_mca_cp_stop(mca, "battery current too high");
+		return;
+	}
+
+	if (mca->cp == MCA_CP_OPENING) {
+		if (ibus_ua / 1000 < MCA_CP_OPEN_IBUS_MA) {
+			mv += MCA_CP_STEP_MV;
+		} else {
+			dev_info(mca->dev, "direct charging at %u mV: bus %d mV %d mA, battery %d mV %d mA\n",
+				 mca->cp_mv, vbus_uv / 1000, ibus_ua / 1000,
+				 vbat, ibat);
+			mca->cp = MCA_CP_ON;
+			mca->cp_polls = 0;
+		}
+	} else {
+		if (ibus_ua / 1000 < MCA_CP_LOW_IBUS_MA) {
+			if (++mca->cp_low >= MCA_CP_LOW_POLLS) {
+				piano_mca_cp_stop(mca, "bus current too low");
+				return;
+			}
+		} else {
+			mca->cp_low = 0;
+		}
+
+		if (ibus_ua / 1000 > mca->cp_ibus_ma || ibat > ibat_max)
+			mv -= MCA_CP_REG_STEP_MV;
+		else if (ibus_ua / 1000 + MCA_CP_BAND_MA < mca->cp_ibus_ma &&
+			 ibat + MCA_CP_BAND_MA < ibat_max &&
+			 max(tbat, tpack) < MCA_CP_TBAT_MAX)
+			mv += MCA_CP_REG_STEP_MV;
+
+		if (++mca->cp_polls % MCA_CP_LOG_POLLS == 0)
+			dev_info(mca->dev, "direct charging at %u mV: bus %d mV %d mA, battery %d mV %d mA %d degC, stage %d.%d degC\n",
+				 mca->cp_mv, vbus_uv / 1000, ibus_ua / 1000,
+				 vbat, ibat, max(tbat, tpack), tdie / 10,
+				 tdie % 10);
+	}
+
+	mv = clamp_t(u32, mv, 2 * vbat, 2 * vbat + MCA_CP_REQ_MAX_DELTA_MV);
+	if (piano_mca_cp_request(mca, mv)) {
+		piano_mca_cp_learn_drop(mca);
+		piano_mca_cp_stop(mca, "request refused");
+	}
+}
+
 static void piano_mca_poll(struct work_struct *work)
 {
 	struct piano_mca *mca = container_of(work, struct piano_mca, poll.work);
@@ -952,10 +1390,21 @@ static void piano_mca_poll(struct work_struct *work)
 	}
 
 	changed = online != mca->online || real_type != mca->real_type;
+	if (online && !mca->online && mca->cp_ibus_cap &&
+	    time_after(jiffies, mca->cp_off_at +
+				msecs_to_jiffies(MCA_CP_DROP_FORGET_MS)))
+		mca->cp_ibus_cap = 0;
+	if (!online && mca->online)
+		mca->cp_off_at = jiffies;
+	if (online && !mca->online)
+		mca->cp_on_at = jiffies;
 	mca->online = online;
 	mca->real_type = real_type;
 
 	if (!online) {
+		piano_mca_cp_learn_drop(mca);
+		piano_mca_cp_stop(mca, "detached");
+		mca->cp = MCA_CP_OFF;
 		if (mca->icl_set_ma)
 			piano_mca_reset_icl(mca);
 		if (mca->fcc_set_ma)
@@ -965,14 +1414,19 @@ static void piano_mca_poll(struct work_struct *work)
 			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RETRY_MS);
 		mca->hv = MCA_HV_OFF;
 		mca->hv_renegs = 0;
+	} else if (charge_policy && piano_mca_cp_active(mca)) {
+		piano_mca_cp_step(mca);
 	} else if (charge_policy) {
 		piano_mca_apply_policy(mca);
+		piano_mca_cp_try_start(mca);
 	}
 	if (changed)
 		power_supply_changed(mca->usb);
 
 	if (mca->service_up)
-		schedule_delayed_work(&mca->poll, msecs_to_jiffies(MCA_POLL_MS));
+		schedule_delayed_work(&mca->poll,
+				      msecs_to_jiffies(piano_mca_cp_active(mca) ?
+						       MCA_CP_POLL_MS : MCA_POLL_MS));
 }
 
 static enum power_supply_usb_type piano_mca_usb_type(u32 real_type)
@@ -1346,16 +1800,18 @@ static const struct attribute_group *piano_mca_usb_groups[] = {
 };
 
 /* The gauges re-read their status as soon as the input changes */
-static char *piano_mca_supplied_to[] = { "bq27z561-0", "bq27z561-1" };
-
 static void piano_mca_stop(void *data)
 {
 	struct piano_mca *mca = data;
+	bool cp;
 
 	cancel_delayed_work_sync(&mca->poll);
+	cp = piano_mca_cp_active(mca);
+	piano_mca_cp_stop(mca, "unbind");
 	if (!mca->service_up)
 		return;
-	if (mca->online && (mca->hv == MCA_HV_REQUESTED || mca->hv == MCA_HV_ON))
+	if (mca->online &&
+	    (cp || mca->hv == MCA_HV_REQUESTED || mca->hv == MCA_HV_ON))
 		piano_mca_request_volt(mca, 5000);
 	if (mca->icl_set_ma)
 		piano_mca_reset_icl(mca);
