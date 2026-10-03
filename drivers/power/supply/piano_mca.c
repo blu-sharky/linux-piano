@@ -201,6 +201,8 @@ MODULE_PARM_DESC(charge_current,
  */
 #define MCA_HV_VBUS_5V_MAX_UV	6000000
 #define MCA_HV_RENEG_MS		10000
+/* with mipps_auth, 9 V waits this long after attach for the authentication */
+#define MCA_HV_AUTH_WAIT_MS	15000
 #define MCA_HV_RENEG_MAX	3
 /* Current limit asked of a PPS source */
 #define MCA_HV_PPS_MIN_MA	500
@@ -1396,8 +1398,12 @@ static void piano_mca_poll(struct work_struct *work)
 		mca->cp_ibus_cap = 0;
 	if (!online && mca->online)
 		mca->cp_off_at = jiffies;
-	if (online && !mca->online)
+	if (online && !mca->online) {
 		mca->cp_on_at = jiffies;
+		/* a voltage change under way breaks the identity exchange */
+		if (mipps_auth)
+			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_AUTH_WAIT_MS);
+	}
 	mca->online = online;
 	mca->real_type = real_type;
 
