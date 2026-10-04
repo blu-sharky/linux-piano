@@ -476,6 +476,7 @@ struct piano_mca {
 	unsigned long cp_on_at;		/* jiffies when it came */
 	bool auth_ok;		/* xiaomi-mipps-auth reported the adapter verified */
 	unsigned long auth_at;	/* jiffies when it did */
+	bool auth_tried;	/* direct charging asked for before any reset */
 	unsigned long hv_retry;	/* jiffies before which 9 V is not asked for */
 	struct pmic_glink_client *pan_client;
 	struct work_struct pan_work;
@@ -985,8 +986,9 @@ static int piano_mca_request_volt(struct piano_mca *mca, u32 mv)
 }
 
 /*
- * Once authenticated, a Xiaomi adapter stays at 5 V, refuses further PD
- * requests and resets itself about 15 s later; it is left alone until then.
+ * Once authenticated, a MiPPS power bank stays at 5 V, refuses further PD
+ * requests and resets itself about 15 s later; it is left alone until then,
+ * after one try at direct charging (see piano_mca_cp_after_auth()).
  */
 static bool piano_mca_auth_pending(struct piano_mca *mca)
 {
@@ -1243,7 +1245,8 @@ static void piano_mca_cp_stop(struct piano_mca *mca, const char *why)
  */
 static void piano_mca_cp_learn_drop(struct piano_mca *mca)
 {
-	if (mca->cp != MCA_CP_ON ||
+	/* not the reset an authenticated adapter may do by itself */
+	if (mca->cp != MCA_CP_ON || piano_mca_auth_pending(mca) ||
 	    mca->cp_ibus_last <= 2 * MCA_CP_DROP_BACKOFF_MA)
 		return;
 
@@ -1285,9 +1288,11 @@ static bool piano_mca_adapter_verified(struct piano_mca *mca)
 }
 
 /*
- * Direct charging after the reset that follows, from 5 V by PPS and without
+ * Direct charging after the authentication, from 5 V by PPS and without
  * asking for 9 V first.  A Xiaomi adapter does not reset: it stays at 5 V
- * and the charger firmware offers its full APDO once it is verified.
+ * and the charger firmware offers its full APDO once it is verified, so
+ * that is tried at once; a source that refuses it is asked again after
+ * its reset, or once the wait for it is over.
  */
 static bool piano_mca_cp_after_auth(struct piano_mca *mca)
 {
@@ -1296,7 +1301,9 @@ static bool piano_mca_cp_after_auth(struct piano_mca *mca)
 		return false;
 	if (mca->auth_ok && time_after(mca->cp_on_at, mca->auth_at))
 		return true;
-	return !piano_mca_auth_pending(mca) && piano_mca_adapter_verified(mca);
+	if (piano_mca_auth_pending(mca) && mca->auth_tried)
+		return false;
+	return piano_mca_adapter_verified(mca);
 }
 
 /*
@@ -1397,11 +1404,17 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 	mca->cp_buck_par = false;
 	mca->cp = MCA_CP_OPENING;
 
+	if (piano_mca_auth_pending(mca))
+		mca->auth_tried = true;
+
 	/* the buck charger carries little meanwhile */
 	ret = piano_mca_cp_set_buck(mca, MCA_CP_BUCK_MA, MCA_CP_BUCK_MA);
 	ret = ret ?: piano_mca_cp_request(mca, start_mv);
 	if (ret) {
 		piano_mca_cp_stop(mca, "start refused");
+		/* again after the adapter reset */
+		if (piano_mca_auth_pending(mca))
+			mca->cp = MCA_CP_OFF;
 		return;
 	}
 
@@ -1937,6 +1950,7 @@ static ssize_t pd_verifed_store(struct device *dev,
 	if (ret == count && !kstrtobool(buf, &flag)) {
 		mca->auth_at = jiffies;
 		mca->auth_ok = flag;
+		mca->auth_tried = false;
 	}
 	return ret;
 }
@@ -1952,7 +1966,14 @@ static ssize_t verify_process_store(struct device *dev,
 				    struct device_attribute *attr,
 				    const char *buf, size_t count)
 {
-	return piano_mca_store_flag(dev, buf, count, MCA_PROP_VERIFY_PROCESS);
+	struct piano_mca *mca = piano_mca_from_dev(dev);
+	ssize_t ret = piano_mca_store_flag(dev, buf, count, MCA_PROP_VERIFY_PROCESS);
+	bool flag;
+
+	/* the authentication is over: direct charging need not wait a poll */
+	if (ret == count && !kstrtobool(buf, &flag) && !flag)
+		mod_delayed_work(system_percpu_wq, &mca->poll, 0);
+	return ret;
 }
 static DEVICE_ATTR_RW(verify_process);
 
