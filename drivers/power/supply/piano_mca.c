@@ -1200,16 +1200,26 @@ static u32 piano_mca_cp_apdo(struct piano_mca *mca, u32 start_mv, u32 *max_mv)
 	return ma;
 }
 
+/* The ADSP holds the adapter verified until the next authentication */
+static bool piano_mca_adapter_verified(struct piano_mca *mca)
+{
+	return mipps_auth &&
+	       piano_mca_read_u32(mca, MCA_PROP_PD_VERIFIED) == 1;
+}
+
 /*
  * Direct charging after the reset that follows, from 5 V by PPS and without
- * asking for 9 V first.
+ * asking for 9 V first.  A Xiaomi adapter does not reset: it stays at 5 V
+ * and the charger firmware offers its full APDO once it is verified.
  */
 static bool piano_mca_cp_after_auth(struct piano_mca *mca)
 {
-	return mipps_auth && mca->auth_ok &&
-	       time_after(mca->cp_on_at, mca->auth_at) &&
-	       mca->hv != MCA_HV_REQUESTED &&
-	       mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV;
+	if (!mipps_auth || mca->hv == MCA_HV_REQUESTED ||
+	    mca->vbus_uv >= MCA_HV_VBUS_5V_MAX_UV)
+		return false;
+	if (mca->auth_ok && time_after(mca->cp_on_at, mca->auth_at))
+		return true;
+	return !piano_mca_auth_pending(mca) && piano_mca_adapter_verified(mca);
 }
 
 /* Called from the poll at 9 V on the buck charger, or right after the auth */
