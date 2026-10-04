@@ -312,10 +312,12 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_BUCK_MA		500	/* buck input limit and charge current */
 /*
  * Stock (strategy_quickchg_pmic_single_cp_charging) has the buck charger
- * carry part of the battery current next to the stage once the stage runs
- * above MCA_CP_PAR_IBUS_MA with more than MCA_CP_PAR_IBAT_MA asked of the
- * battery: its 5000/2700 mA row, the one within 8 A, at FCC 2000 and
- * input 1500 mA.  That moves heat from the stage to the PMIC.
+ * carry part of the battery current next to the stage once the source
+ * gives more than MCA_CP_PAR_IBUS_MA (stage and buck charger together,
+ * which the share moving between them leaves alone) with more than
+ * MCA_CP_PAR_IBAT_MA asked of the battery: its 5000/2700 mA row, the one
+ * within 8 A, at FCC 2000 and input 1500 mA.  That moves heat from the
+ * stage to the PMIC.
  */
 #define MCA_CP_PAR_IBUS_MA	2700
 #define MCA_CP_PAR_IBAT_MA	5000
@@ -1387,7 +1389,7 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 static void piano_mca_cp_step(struct piano_mca *mca)
 {
 	int vbat, ibat, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibus, over;
-	int ibat_max, target;
+	int ibat_max, target, ibus_all;
 	u32 mv = mca->cp_mv;
 	bool par;
 
@@ -1495,11 +1497,12 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		}
 
 		/* only from a source that feeds both at that bus current */
+		ibus_all = ibus + mca->ibus_ua / 1000;
 		par = ibat_max > MCA_CP_PAR_IBAT_MA &&
 		      mca->cp_ma >= MCA_CP_PAR_IBUS_MA + MCA_CP_PAR_ICL_MA + 200 &&
-		      (ibus > MCA_CP_PAR_IBUS_MA ||
+		      (ibus_all > MCA_CP_PAR_IBUS_MA ||
 		       (mca->cp_buck_par &&
-			ibus > MCA_CP_PAR_IBUS_MA - MCA_CP_PAR_HYS_MA));
+			ibus_all > MCA_CP_PAR_IBUS_MA - MCA_CP_PAR_HYS_MA));
 		if (par != mca->cp_buck_par) {
 			if (piano_mca_cp_set_buck(mca,
 						  par ? MCA_CP_PAR_ICL_MA : MCA_CP_BUCK_MA,
@@ -1518,12 +1521,20 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		/* what the source gives, less the buck charger's input */
 		target = min(target, (int)mca->cp_ma - 200 -
 			     (mca->cp_buck_par ? MCA_CP_PAR_ICL_MA : MCA_CP_BUCK_MA));
+		/*
+		 * The stage gives the battery about twice its bus current,
+		 * next to the buck charger's share.  The gauges average over
+		 * seconds, so the battery limit is held through the stage's
+		 * own reading and theirs only trims it slowly.
+		 */
+		target = min(target, (ibat_max - (int)mca->fcc_set_ma) / 2);
 
-		/* the battery takes about twice the bus current */
-		over = max(ibus - target, (ibat - ibat_max) / 2);
+		over = ibus - target;
 		if (over > 0)
 			mv -= clamp(over / MCA_CP_REG_STEP_MA * MCA_CP_REG_STEP_MV,
 				    MCA_CP_REG_STEP_MV, MCA_CP_REG_MAX_STEP_MV);
+		else if (ibat > ibat_max)
+			mv -= MCA_CP_REG_STEP_MV;
 		else if (ibus + MCA_CP_BAND_MA < target &&
 			 ibat + MCA_CP_BAND_MA < ibat_max)
 			mv += MCA_CP_REG_STEP_MV;
