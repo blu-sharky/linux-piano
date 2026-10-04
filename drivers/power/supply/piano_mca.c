@@ -245,13 +245,16 @@ MODULE_PARM_DESC(mipps_auth,
  * follows stock: ask the source for twice the battery voltage plus
  * MCA_CP_DELTA_MV, enable the stage, raise the voltage MCA_CP_STEP_MV at a
  * time until current flows, then regulate the voltage every MCA_CP_POLL_MS
- * so the bus current stays at cp_ibus_max and the battery current (both
- * gauges) below cp_ibat_max (MCA_CP_IBAT_COOL_MA below MCA_CP_TBAT_FULL
- * degC, as stock lowers it there too).  The limits are inside stock's
- * (8 A up to 4.15 V at 18-48 degC without FFC, 12.4 A with it, sources
- * up to 6.1 A): direct charging only runs from MCA_CP_VBAT_MIN_MV to
- * MCA_CP_VBAT_MAX_MV and from MCA_CP_TBAT_MIN to MCA_CP_TBAT_MAX degC (left
- * above MCA_CP_TBAT_EXIT), and the buck charger does the rest.  Anything
+ * so the bus current stays at its target and the battery current (both
+ * gauges) below the limit of piano_mca_cp_ibat_limit().  The limits follow
+ * stock's battery tables without FFC (the charger firmware floats at
+ * 4350 mV), within a narrower window: direct charging only runs from
+ * MCA_CP_VBAT_MIN_MV to MCA_CP_VBAT_MAX_MV and from MCA_CP_TBAT_MIN to
+ * MCA_CP_TBAT_EXIT degC, and the buck charger does the rest.  The bus
+ * target is cp_ibus_max, at most MCA_CP_IBUS_MAX_MA (stock div_max_curr)
+ * from a verified Xiaomi adapter and MCA_CP_THIRD_IBUS_MA (stock
+ * third_pps_ibus_max) from other PPS sources, and is lowered while the
+ * stage is hot, see piano_mca_cp_step().  Anything
  * unexpected (a read failure, the stage turning itself off, the bus out of
  * range, too little or too much current, detach, an ADSP restart, unbind)
  * turns the stage off and goes back to 9 V on the buck charger until the
@@ -260,12 +263,34 @@ MODULE_PARM_DESC(mipps_auth,
  */
 #define MCA_CP_POLL_MS		500
 #define MCA_CP_VBAT_MIN_MV	3500
-#define MCA_CP_VBAT_START_MV	4000	/* only starts below this */
-#define MCA_CP_VBAT_MAX_MV	4100
+#define MCA_CP_VBAT_START_MV	4100	/* only starts below this */
+#define MCA_CP_VBAT_MAX_MV	4200
+/* stock normal_volt_para18_35: 8 A, 7.23 A from 4150 mV */
+#define MCA_CP_VSTEP_MV		4150
+#define MCA_CP_VSTEP_MA		7230
+/*
+ * Battery temperature, degC, of the coolest and the warmest of the two
+ * cells and the pack: stock batt_para_lwn allows 7.23 A from 13, 8 A from
+ * 18 and 4.52 A from 48 to 55 degC (2 degC hysteresis on the warm side).
+ */
 #define MCA_CP_TBAT_MIN		15
-#define MCA_CP_TBAT_MAX		38	/* starts, and raises the current, below */
-#define MCA_CP_TBAT_EXIT	40
-#define MCA_CP_TDIE_MAX		800	/* 0.1 degC */
+#define MCA_CP_TBAT_FULL	18	/* MCA_CP_IBAT_REDUCED_MA below */
+#define MCA_CP_TBAT_WARM	40	/* MCA_CP_IBAT_REDUCED_MA from */
+#define MCA_CP_TBAT_EXIT	45
+#define MCA_CP_TBAT_HYS		2
+#define MCA_CP_IBAT_MAX_MA	8000
+#define MCA_CP_IBAT_REDUCED_MA	4500
+/*
+ * Stage temperature, 0.1 degC: from MCA_CP_TDIE_HOT the bus target drops
+ * MCA_CP_TDIE_STEP_MA a poll (the stage warms about 1 degC/s at 4 A), down
+ * to MCA_CP_TDIE_MIN_MA, and comes back a quarter as fast below
+ * MCA_CP_TDIE_HOT - MCA_CP_TDIE_HYS; MCA_CP_TDIE_MAX leaves.
+ */
+#define MCA_CP_TDIE_HOT		700
+#define MCA_CP_TDIE_HYS		50
+#define MCA_CP_TDIE_MAX		800
+#define MCA_CP_TDIE_STEP_MA	200
+#define MCA_CP_TDIE_MIN_MA	1000
 #define MCA_CP_DELTA_MV		300	/* stock div_delta_volt */
 #define MCA_CP_STEP_MV		40	/* stock open path step */
 /*
@@ -273,6 +298,8 @@ MODULE_PARM_DESC(mipps_auth,
  * about 140 mA, so it is held between the target and MCA_CP_BAND_MA below.
  */
 #define MCA_CP_REG_STEP_MV	20
+#define MCA_CP_REG_STEP_MA	140
+#define MCA_CP_REG_MAX_STEP_MV	200	/* down, when well above the target */
 #define MCA_CP_BAND_MA		200
 /*
  * Above twice the battery voltage: the most the stage may see, and the most
@@ -283,9 +310,9 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_PPS_MIN_MV	6000
 #define MCA_CP_PPS_MAX_MV	10000
 #define MCA_CP_BUCK_MA		500	/* buck input limit and charge current */
-#define MCA_CP_PPS_MAX_MA	5000	/* current limit asked of the source */
-#define MCA_CP_TBAT_FULL	18	/* full battery current from here */
-#define MCA_CP_IBAT_COOL_MA	4000
+#define MCA_CP_PPS_MAX_MA	6000	/* current limit asked of the source */
+#define MCA_CP_IBUS_MAX_MA	5000
+#define MCA_CP_THIRD_IBUS_MA	4100
 /* bus over-current protection of the stage, above the target */
 #define MCA_CP_BUSOCP_MARGIN_MA	1000
 #define MCA_CP_BUSOCP_MAX_MA	6000
@@ -294,6 +321,8 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_LOW_IBUS_MA	300	/* leaves when below for MCA_CP_LOW_POLLS */
 #define MCA_CP_TRIP_IBUS_MA	500	/* leaves at once this far above the target */
 #define MCA_CP_TRIP_IBAT_MA	1000
+/* a lowered battery limit trips only this long after it was lowered */
+#define MCA_CP_TRIP_GRACE_MS	5000
 #define MCA_CP_LOW_POLLS	6
 #define MCA_CP_LOG_POLLS	20
 /* see piano_mca_cp_learn_drop() */
@@ -309,15 +338,15 @@ module_param(cp_charge, bool, 0444);
 MODULE_PARM_DESC(cp_charge,
 		 "Charge through the SC8541 switched-capacitor stage from PPS sources; needs hv_charge and charge_current (default: off)");
 
-static unsigned int cp_ibus_max = 2000;
+static unsigned int cp_ibus_max = 4000;
 module_param(cp_ibus_max, uint, 0444);
 MODULE_PARM_DESC(cp_ibus_max,
-		 "Bus current of the switched-capacitor stage, mA (500-4800, default 2000; at most what the source offers less 700)");
+		 "Bus current of the switched-capacitor stage, mA (500-5000, default 4000; at most what the source offers less 700, 4100 from unverified sources)");
 
-static unsigned int cp_ibat_max = 5000;
+static unsigned int cp_ibat_max = MCA_CP_IBAT_MAX_MA;
 module_param(cp_ibat_max, uint, 0444);
 MODULE_PARM_DESC(cp_ibat_max,
-		 "Battery current while direct charging, both cells, mA (1000-8000, default 5000)");
+		 "Battery current while direct charging, both cells, mA (1000-8000, default 8000; lower by battery voltage and temperature)");
 
 static bool pan_ack;
 module_param(pan_ack, bool, 0444);
@@ -407,6 +436,10 @@ struct piano_mca {
 	u32 cp_ma;		/* its current limit */
 	u32 cp_max_mv;		/* the most the source offers */
 	u32 cp_ibus_ma;		/* bus current target */
+	u32 cp_ibus_hot;	/* the target as lowered for the stage temperature */
+	u32 cp_ibat_trip;	/* battery current limit the trip checks against */
+	unsigned long cp_trip_at;	/* jiffies when the limit was last that high */
+	bool cp_warm;		/* battery limit reduced for temperature */
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
 	u32 cp_ibus_last;	/* bus current at the last step */
@@ -1222,6 +1255,26 @@ static bool piano_mca_cp_after_auth(struct piano_mca *mca)
 	return !piano_mca_auth_pending(mca) && piano_mca_adapter_verified(mca);
 }
 
+/*
+ * Battery current limit (both cells) for the battery voltage and the
+ * coolest and warmest temperature, see MCA_CP_TBAT_* and MCA_CP_VSTEP_*
+ */
+static u32 piano_mca_cp_ibat_limit(struct piano_mca *mca, int vbat,
+				   int tcool, int twarm)
+{
+	u32 ma = clamp(cp_ibat_max, 1000U, (u32)MCA_CP_IBAT_MAX_MA);
+
+	mca->cp_warm = twarm >= MCA_CP_TBAT_WARM ||
+		       (mca->cp_warm &&
+			twarm > MCA_CP_TBAT_WARM - MCA_CP_TBAT_HYS);
+	if (mca->cp_warm || tcool < MCA_CP_TBAT_FULL)
+		ma = min_t(u32, ma, MCA_CP_IBAT_REDUCED_MA);
+	if (vbat >= MCA_CP_VSTEP_MV)
+		ma = min_t(u32, ma, MCA_CP_VSTEP_MA);
+
+	return ma;
+}
+
 /* Called from the poll at 9 V on the buck charger, or right after the auth */
 static void piano_mca_cp_try_start(struct piano_mca *mca)
 {
@@ -1238,7 +1291,7 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 	tpack = (s32)piano_mca_read_u32(mca, MCA_PROP_PACK_TBAT);
 	if (vbat < MCA_CP_VBAT_MIN_MV || vbat >= MCA_CP_VBAT_START_MV ||
 	    min(tbat, tpack) < MCA_CP_TBAT_MIN ||
-	    max(tbat, tpack) >= MCA_CP_TBAT_MAX ||
+	    max(tbat, tpack) >= MCA_CP_TBAT_WARM - MCA_CP_TBAT_HYS ||
 	    piano_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
 		return;
 	/* PD requests in the middle of the authentication break it */
@@ -1254,8 +1307,11 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 
 	mca->cp_ma = min_t(u32, ma, MCA_CP_PPS_MAX_MA);
 	mca->cp_max_mv = max_mv;
-	mca->cp_ibus_ma = min(clamp(cp_ibus_max, 500U, 4800U),
+	mca->cp_ibus_ma = min(clamp(cp_ibus_max, 500U, (u32)MCA_CP_IBUS_MAX_MA),
 			      mca->cp_ma - MCA_CP_BUCK_MA - 200);
+	if (!piano_mca_adapter_verified(mca))
+		mca->cp_ibus_ma = min_t(u32, mca->cp_ibus_ma,
+					MCA_CP_THIRD_IBUS_MA);
 	if (mca->cp_ibus_cap)
 		mca->cp_ibus_ma = min(mca->cp_ibus_ma, mca->cp_ibus_cap);
 	if (mca->cp_ibus_ma < 2 * MCA_CP_OPEN_IBUS_MA) {
@@ -1280,6 +1336,9 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 	mca->cp_mv = 0;
 	mca->cp_polls = 0;
 	mca->cp_low = 0;
+	mca->cp_ibus_hot = mca->cp_ibus_ma;
+	mca->cp_ibat_trip = 0;
+	mca->cp_warm = false;
 	mca->cp = MCA_CP_OPENING;
 
 	/* the buck charger carries little meanwhile */
@@ -1302,7 +1361,8 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 /* One step of direct charging, every MCA_CP_POLL_MS */
 static void piano_mca_cp_step(struct piano_mca *mca)
 {
-	int vbat, ibat, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibat_max;
+	int vbat, ibat, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibus, over;
+	int ibat_max, target;
 	u32 mv = mca->cp_mv;
 
 	if (piano_mca_gauges(&vbat, &ibat, &tbat) ||
@@ -1317,7 +1377,7 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		return;
 	}
 	if (min(tbat, tpack) < MCA_CP_TBAT_MIN ||
-	    max(tbat, tpack) > MCA_CP_TBAT_EXIT) {
+	    max(tbat, tpack) >= MCA_CP_TBAT_EXIT) {
 		piano_mca_cp_stop(mca, "battery temperature");
 		return;
 	}
@@ -1326,9 +1386,16 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		return;
 	}
 
-	ibat_max = clamp(cp_ibat_max, 1000U, 8000U);
-	if (min(tbat, tpack) < MCA_CP_TBAT_FULL)
-		ibat_max = min(ibat_max, MCA_CP_IBAT_COOL_MA);
+	ibat_max = piano_mca_cp_ibat_limit(mca, vbat, min(tbat, tpack),
+					   max(tbat, tpack));
+	/* a lowered limit is regulated down to before it trips */
+	if (ibat_max >= (int)mca->cp_ibat_trip) {
+		mca->cp_ibat_trip = ibat_max;
+		mca->cp_trip_at = jiffies;
+	} else if (time_after(jiffies, mca->cp_trip_at +
+				       msecs_to_jiffies(MCA_CP_TRIP_GRACE_MS))) {
+		mca->cp_ibat_trip = ibat_max;
+	}
 
 	if (mca->cp == MCA_CP_OPENING &&
 	    ++mca->cp_polls > MCA_CP_OPEN_TRIES) {
@@ -1353,7 +1420,8 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		piano_mca_cp_stop(mca, "stage read failed");
 		return;
 	}
-	mca->cp_ibus_last = max(ibus_ua, 0) / 1000;
+	ibus = ibus_ua / 1000;
+	mca->cp_ibus_last = max(ibus, 0);
 	if (vbus_uv / 1000 > 2 * vbat + MCA_CP_VBUS_MAX_DELTA_MV) {
 		piano_mca_cp_stop(mca, "bus voltage too high");
 		return;
@@ -1362,27 +1430,36 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		piano_mca_cp_stop(mca, "stage temperature");
 		return;
 	}
-	if (ibus_ua / 1000 > mca->cp_ibus_ma + MCA_CP_TRIP_IBUS_MA) {
+	if (ibus > (int)mca->cp_ibus_ma + MCA_CP_TRIP_IBUS_MA) {
 		piano_mca_cp_stop(mca, "bus current too high");
 		return;
 	}
-	if (ibat > ibat_max + MCA_CP_TRIP_IBAT_MA) {
+	if (ibat > (int)mca->cp_ibat_trip + MCA_CP_TRIP_IBAT_MA) {
 		piano_mca_cp_stop(mca, "battery current too high");
 		return;
 	}
 
+	/* the stage warms about 1 degC/s at 4 A: back off before it trips */
+	if (tdie >= MCA_CP_TDIE_HOT)
+		mca->cp_ibus_hot = max_t(u32, mca->cp_ibus_hot - MCA_CP_TDIE_STEP_MA,
+					 min_t(u32, MCA_CP_TDIE_MIN_MA, mca->cp_ibus_ma));
+	else if (tdie < MCA_CP_TDIE_HOT - MCA_CP_TDIE_HYS)
+		mca->cp_ibus_hot = min(mca->cp_ibus_hot + MCA_CP_TDIE_STEP_MA / 4,
+				       mca->cp_ibus_ma);
+	target = mca->cp_ibus_hot;
+
 	if (mca->cp == MCA_CP_OPENING) {
-		if (ibus_ua / 1000 < MCA_CP_OPEN_IBUS_MA) {
+		if (ibus < MCA_CP_OPEN_IBUS_MA) {
 			mv += MCA_CP_STEP_MV;
 		} else {
 			dev_info(mca->dev, "direct charging at %u mV: bus %d mV %d mA, battery %d mV %d mA\n",
-				 mca->cp_mv, vbus_uv / 1000, ibus_ua / 1000,
+				 mca->cp_mv, vbus_uv / 1000, ibus,
 				 vbat, ibat);
 			mca->cp = MCA_CP_ON;
 			mca->cp_polls = 0;
 		}
 	} else {
-		if (ibus_ua / 1000 < MCA_CP_LOW_IBUS_MA) {
+		if (ibus < MCA_CP_LOW_IBUS_MA) {
 			if (++mca->cp_low >= MCA_CP_LOW_POLLS) {
 				piano_mca_cp_stop(mca, "bus current too low");
 				return;
@@ -1391,18 +1468,20 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 			mca->cp_low = 0;
 		}
 
-		if (ibus_ua / 1000 > mca->cp_ibus_ma || ibat > ibat_max)
-			mv -= MCA_CP_REG_STEP_MV;
-		else if (ibus_ua / 1000 + MCA_CP_BAND_MA < mca->cp_ibus_ma &&
-			 ibat + MCA_CP_BAND_MA < ibat_max &&
-			 max(tbat, tpack) < MCA_CP_TBAT_MAX)
+		/* the battery takes about twice the bus current */
+		over = max(ibus - target, (ibat - ibat_max) / 2);
+		if (over > 0)
+			mv -= clamp(over / MCA_CP_REG_STEP_MA * MCA_CP_REG_STEP_MV,
+				    MCA_CP_REG_STEP_MV, MCA_CP_REG_MAX_STEP_MV);
+		else if (ibus + MCA_CP_BAND_MA < target &&
+			 ibat + MCA_CP_BAND_MA < ibat_max)
 			mv += MCA_CP_REG_STEP_MV;
 
 		if (++mca->cp_polls % MCA_CP_LOG_POLLS == 0)
-			dev_info(mca->dev, "direct charging at %u mV: bus %d mV %d mA, battery %d mV %d mA %d degC, stage %d.%d degC\n",
-				 mca->cp_mv, vbus_uv / 1000, ibus_ua / 1000,
-				 vbat, ibat, max(tbat, tpack), tdie / 10,
-				 tdie % 10);
+			dev_info(mca->dev, "direct charging at %u mV: bus %d mV %d/%d mA, battery %d mV %d/%d mA %d degC, stage %d.%d degC\n",
+				 mca->cp_mv, vbus_uv / 1000, ibus, target,
+				 vbat, ibat, ibat_max, max(tbat, tpack),
+				 tdie / 10, tdie % 10);
 	}
 
 	mv = clamp_t(u32, mv, 2 * vbat, 2 * vbat + MCA_CP_REQ_MAX_DELTA_MV);
