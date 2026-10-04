@@ -278,8 +278,14 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_TBAT_WARM	40	/* MCA_CP_IBAT_REDUCED_MA from */
 #define MCA_CP_TBAT_EXIT	45
 #define MCA_CP_TBAT_HYS		2
-/* the pack reading moves 38-40 degC within seconds: held reduced this long */
+/*
+ * The pack reading follows the current within seconds (40 to 37 degC in
+ * 12 s after a step down): from MCA_CP_TBAT_WARM the limit is held
+ * reduced this long, then comes back MCA_CP_TBAT_RAMP_MA at a time
+ */
 #define MCA_CP_TBAT_HOLD_MS	30000
+#define MCA_CP_TBAT_RAMP_MA	500
+#define MCA_CP_TBAT_RAMP_MS	15000
 #define MCA_CP_IBAT_MAX_MA	8000
 #define MCA_CP_IBAT_REDUCED_MA	4500
 /*
@@ -459,8 +465,8 @@ struct piano_mca {
 	u32 cp_ibat_trip;	/* battery current limit the trip checks against */
 	/* jiffies when the limit was last that high, or the stage above target */
 	unsigned long cp_trip_at;
-	bool cp_warm;		/* battery limit reduced for temperature */
-	unsigned long cp_warm_at;	/* jiffies when it last was too warm */
+	u32 cp_warm_ma;		/* battery limit as reduced for temperature */
+	unsigned long cp_warm_at;	/* jiffies when it last changed */
 	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
@@ -1303,14 +1309,20 @@ static u32 piano_mca_cp_ibat_limit(struct piano_mca *mca, int vbat,
 	u32 ma = clamp(cp_ibat_max, 1000U, (u32)MCA_CP_IBAT_MAX_MA);
 
 	if (twarm >= MCA_CP_TBAT_WARM) {
-		mca->cp_warm = true;
+		mca->cp_warm_ma = MCA_CP_IBAT_REDUCED_MA;
 		mca->cp_warm_at = jiffies;
-	} else if (twarm <= MCA_CP_TBAT_WARM - MCA_CP_TBAT_HYS &&
+	} else if (mca->cp_warm_ma < MCA_CP_IBAT_MAX_MA &&
+		   twarm <= MCA_CP_TBAT_WARM - MCA_CP_TBAT_HYS &&
 		   time_after(jiffies, mca->cp_warm_at +
-				       msecs_to_jiffies(MCA_CP_TBAT_HOLD_MS))) {
-		mca->cp_warm = false;
+			      msecs_to_jiffies(mca->cp_warm_ma == MCA_CP_IBAT_REDUCED_MA ?
+					       MCA_CP_TBAT_HOLD_MS :
+					       MCA_CP_TBAT_RAMP_MS))) {
+		mca->cp_warm_ma = min(mca->cp_warm_ma + MCA_CP_TBAT_RAMP_MA,
+				      (u32)MCA_CP_IBAT_MAX_MA);
+		mca->cp_warm_at = jiffies;
 	}
-	if (mca->cp_warm || tcool < MCA_CP_TBAT_FULL)
+	ma = min(ma, mca->cp_warm_ma);
+	if (tcool < MCA_CP_TBAT_FULL)
 		ma = min_t(u32, ma, MCA_CP_IBAT_REDUCED_MA);
 	if (vbat >= MCA_CP_VSTEP_MV)
 		ma = min_t(u32, ma, MCA_CP_VSTEP_MA);
@@ -1381,7 +1393,7 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 	mca->cp_low = 0;
 	mca->cp_ibus_hot = mca->cp_ibus_ma;
 	mca->cp_ibat_trip = 0;
-	mca->cp_warm = false;
+	mca->cp_warm_ma = MCA_CP_IBAT_MAX_MA;
 	mca->cp_buck_par = false;
 	mca->cp = MCA_CP_OPENING;
 
@@ -1536,8 +1548,9 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		/*
 		 * The stage gives the battery about twice its bus current,
 		 * next to the buck charger's share.  The gauges average over
-		 * seconds, so the battery limit is held through the stage's
-		 * own reading and theirs only trims it slowly.
+		 * 10-15 s, so the battery limit is held through the stage's
+		 * own reading and theirs only trims it slowly, once they
+		 * have caught up with a lowered limit.
 		 */
 		target = min(target, (ibat_max - (int)mca->fcc_set_ma) / 2);
 
@@ -1545,7 +1558,7 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		if (over > 0)
 			mv -= clamp(over / MCA_CP_REG_STEP_MA * MCA_CP_REG_STEP_MV,
 				    MCA_CP_REG_STEP_MV, MCA_CP_REG_MAX_STEP_MV);
-		else if (ibat > ibat_max)
+		else if (ibat > ibat_max && mca->cp_ibat_trip <= ibat_max)
 			mv -= MCA_CP_REG_STEP_MV;
 		else if (ibus + MCA_CP_BAND_MA < target &&
 			 ibat + MCA_CP_BAND_MA < ibat_max)
