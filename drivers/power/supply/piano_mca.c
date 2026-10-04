@@ -310,6 +310,18 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_PPS_MIN_MV	6000
 #define MCA_CP_PPS_MAX_MV	10000
 #define MCA_CP_BUCK_MA		500	/* buck input limit and charge current */
+/*
+ * Stock (strategy_quickchg_pmic_single_cp_charging) has the buck charger
+ * carry part of the battery current next to the stage once the stage runs
+ * above MCA_CP_PAR_IBUS_MA with more than MCA_CP_PAR_IBAT_MA asked of the
+ * battery: its 5000/2700 mA row, the one within 8 A, at FCC 2000 and
+ * input 1500 mA.  That moves heat from the stage to the PMIC.
+ */
+#define MCA_CP_PAR_IBUS_MA	2700
+#define MCA_CP_PAR_IBAT_MA	5000
+#define MCA_CP_PAR_HYS_MA	300
+#define MCA_CP_PAR_FCC_MA	2000
+#define MCA_CP_PAR_ICL_MA	1500
 #define MCA_CP_PPS_MAX_MA	6000	/* current limit asked of the source */
 #define MCA_CP_IBUS_MAX_MA	5000
 #define MCA_CP_THIRD_IBUS_MA	4100
@@ -440,6 +452,7 @@ struct piano_mca {
 	u32 cp_ibat_trip;	/* battery current limit the trip checks against */
 	unsigned long cp_trip_at;	/* jiffies when the limit was last that high */
 	bool cp_warm;		/* battery limit reduced for temperature */
+	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
 	u32 cp_ibus_last;	/* bus current at the last step */
@@ -1175,6 +1188,22 @@ static int piano_mca_cp_request(struct piano_mca *mca, u32 mv)
  * Turn the stage off and go back to the buck charger: the next poll asks
  * the source for 9 V again and puts the buck limits back.
  */
+/* Buck charger share while direct charging */
+static int piano_mca_cp_set_buck(struct piano_mca *mca, u32 icl_ma,
+				 u32 fcc_ma)
+{
+	int ret;
+
+	ret = piano_mca_write_u32(mca, MCA_PROP_ICL, icl_ma);
+	ret = ret ?: piano_mca_write_u32(mca, MCA_PROP_FCC, fcc_ma);
+	if (ret)
+		return ret;
+
+	mca->icl_set_ma = icl_ma;
+	mca->fcc_set_ma = fcc_ma;
+	return 0;
+}
+
 static void piano_mca_cp_stop(struct piano_mca *mca, const char *why)
 {
 	if (!piano_mca_cp_active(mca))
@@ -1339,15 +1368,11 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 	mca->cp_ibus_hot = mca->cp_ibus_ma;
 	mca->cp_ibat_trip = 0;
 	mca->cp_warm = false;
+	mca->cp_buck_par = false;
 	mca->cp = MCA_CP_OPENING;
 
 	/* the buck charger carries little meanwhile */
-	ret = piano_mca_write_u32(mca, MCA_PROP_ICL, MCA_CP_BUCK_MA);
-	ret = ret ?: piano_mca_write_u32(mca, MCA_PROP_FCC, MCA_CP_BUCK_MA);
-	if (!ret) {
-		mca->icl_set_ma = MCA_CP_BUCK_MA;
-		mca->fcc_set_ma = MCA_CP_BUCK_MA;
-	}
+	ret = piano_mca_cp_set_buck(mca, MCA_CP_BUCK_MA, MCA_CP_BUCK_MA);
 	ret = ret ?: piano_mca_cp_request(mca, start_mv);
 	if (ret) {
 		piano_mca_cp_stop(mca, "start refused");
@@ -1364,6 +1389,7 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 	int vbat, ibat, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibus, over;
 	int ibat_max, target;
 	u32 mv = mca->cp_mv;
+	bool par;
 
 	if (piano_mca_gauges(&vbat, &ibat, &tbat) ||
 	    piano_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &on)) {
@@ -1467,6 +1493,31 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		} else {
 			mca->cp_low = 0;
 		}
+
+		/* only from a source that feeds both at that bus current */
+		par = ibat_max > MCA_CP_PAR_IBAT_MA &&
+		      mca->cp_ma >= MCA_CP_PAR_IBUS_MA + MCA_CP_PAR_ICL_MA + 200 &&
+		      (ibus > MCA_CP_PAR_IBUS_MA ||
+		       (mca->cp_buck_par &&
+			ibus > MCA_CP_PAR_IBUS_MA - MCA_CP_PAR_HYS_MA));
+		if (par != mca->cp_buck_par) {
+			if (piano_mca_cp_set_buck(mca,
+						  par ? MCA_CP_PAR_ICL_MA : MCA_CP_BUCK_MA,
+						  par ? MCA_CP_PAR_FCC_MA : MCA_CP_BUCK_MA)) {
+				piano_mca_cp_stop(mca, "buck charger refused");
+				return;
+			}
+			mca->cp_buck_par = par;
+			/* make room on the bus for the buck charger's share */
+			if (par)
+				mv -= (MCA_CP_PAR_FCC_MA - MCA_CP_BUCK_MA) / 2 /
+				      MCA_CP_REG_STEP_MA * MCA_CP_REG_STEP_MV;
+			dev_info(mca->dev, "buck charger at %u mA%s\n",
+				 mca->fcc_set_ma, par ? " in parallel" : "");
+		}
+		/* what the source gives, less the buck charger's input */
+		target = min(target, (int)mca->cp_ma - 200 -
+			     (mca->cp_buck_par ? MCA_CP_PAR_ICL_MA : MCA_CP_BUCK_MA));
 
 		/* the battery takes about twice the bus current */
 		over = max(ibus - target, (ibat - ibat_max) / 2);
