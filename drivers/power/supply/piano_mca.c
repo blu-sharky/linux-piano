@@ -470,7 +470,7 @@ struct piano_mca {
 	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
-	u32 cp_ibus_last;	/* bus current at the last step */
+	u32 cp_ibus_last;	/* stage and buck input current at the last step */
 	u32 cp_ibus_cap;	/* learned from a source dropping out, 0 if none */
 	unsigned long cp_off_at;	/* jiffies when the source went away */
 	unsigned long cp_on_at;		/* jiffies when it came */
@@ -1241,7 +1241,8 @@ static void piano_mca_cp_stop(struct piano_mca *mca, const char *why)
  * A source that drops out under direct charging (a hard reset; the request
  * in flight may be refused first) did not take that much current, whatever
  * it advertised: aim lower from then on, unless it is away for longer than
- * MCA_CP_DROP_FORGET_MS (a replug).
+ * MCA_CP_DROP_FORGET_MS (a replug).  The current is what the stage and the
+ * buck charger took together.
  */
 static void piano_mca_cp_learn_drop(struct piano_mca *mca)
 {
@@ -1251,8 +1252,14 @@ static void piano_mca_cp_learn_drop(struct piano_mca *mca)
 		return;
 
 	mca->cp_ibus_cap = mca->cp_ibus_last - MCA_CP_DROP_BACKOFF_MA;
-	dev_warn(mca->dev, "source dropped out at %u mA of bus current, %u mA from now on\n",
+	dev_warn(mca->dev, "source dropped out at %u mA, %u mA from now on\n",
 		 mca->cp_ibus_last, mca->cp_ibus_cap);
+}
+
+/* What the source gives: its APDO current, less once it dropped out */
+static u32 piano_mca_cp_src_ma(struct piano_mca *mca)
+{
+	return mca->cp_ibus_cap ? min(mca->cp_ma, mca->cp_ibus_cap) : mca->cp_ma;
 }
 
 /* The PPS APDO direct charging can use, 0 if none */
@@ -1341,7 +1348,7 @@ static u32 piano_mca_cp_ibat_limit(struct piano_mca *mca, int vbat,
 static void piano_mca_cp_try_start(struct piano_mca *mca)
 {
 	int vbat, ibat, tbat, tpack, ret;
-	u32 start_mv, ma, max_mv = 0;
+	u32 start_mv, ma, src_ma, max_mv = 0;
 
 	if (!cp_charge || !hv_charge || !charge_current ||
 	    mca->cp != MCA_CP_OFF ||
@@ -1369,13 +1376,13 @@ static void piano_mca_cp_try_start(struct piano_mca *mca)
 
 	mca->cp_ma = min_t(u32, ma, MCA_CP_PPS_MAX_MA);
 	mca->cp_max_mv = max_mv;
+	src_ma = piano_mca_cp_src_ma(mca);
+	src_ma -= min_t(u32, src_ma, MCA_CP_BUCK_MA + 200);
 	mca->cp_ibus_ma = min(clamp(cp_ibus_max, 500U, (u32)MCA_CP_IBUS_MAX_MA),
-			      mca->cp_ma - MCA_CP_BUCK_MA - 200);
+			      src_ma);
 	if (!piano_mca_adapter_verified(mca))
 		mca->cp_ibus_ma = min_t(u32, mca->cp_ibus_ma,
 					MCA_CP_THIRD_IBUS_MA);
-	if (mca->cp_ibus_cap)
-		mca->cp_ibus_ma = min(mca->cp_ibus_ma, mca->cp_ibus_cap);
 	if (mca->cp_ibus_ma < 2 * MCA_CP_OPEN_IBUS_MA) {
 		mca->cp = MCA_CP_DONE;
 		return;
@@ -1488,7 +1495,7 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		return;
 	}
 	ibus = ibus_ua / 1000;
-	mca->cp_ibus_last = max(ibus, 0);
+	mca->cp_ibus_last = max(ibus + mca->ibus_ua / 1000, 0);
 	if (vbus_uv / 1000 > 2 * vbat + MCA_CP_VBUS_MAX_DELTA_MV) {
 		piano_mca_cp_stop(mca, "bus voltage too high");
 		return;
@@ -1538,7 +1545,8 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		/* only from a source that feeds both at that bus current */
 		ibus_all = ibus + mca->ibus_ua / 1000;
 		par = ibat_max > MCA_CP_PAR_IBAT_MA &&
-		      mca->cp_ma >= MCA_CP_PAR_IBUS_MA + MCA_CP_PAR_ICL_MA + 200 &&
+		      piano_mca_cp_src_ma(mca) >=
+				MCA_CP_PAR_IBUS_MA + MCA_CP_PAR_ICL_MA + 200 &&
 		      (ibus_all > MCA_CP_PAR_IBUS_MA ||
 		       (mca->cp_buck_par &&
 			ibus_all > MCA_CP_PAR_IBUS_MA - MCA_CP_PAR_HYS_MA));
@@ -1558,7 +1566,7 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 				 mca->fcc_set_ma, par ? " in parallel" : "");
 		}
 		/* what the source gives, less the buck charger's input */
-		target = min(target, (int)mca->cp_ma - 200 -
+		target = min(target, (int)piano_mca_cp_src_ma(mca) - 200 -
 			     (mca->cp_buck_par ? MCA_CP_PAR_ICL_MA : MCA_CP_BUCK_MA));
 		/*
 		 * The stage gives the battery about twice its bus current,
