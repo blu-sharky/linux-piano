@@ -1448,6 +1448,8 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 	}
 	if (piano_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS)) {
 		piano_mca_cp_stop(mca, "adapter authentication");
+		/* again once it is over */
+		mca->cp = MCA_CP_OFF;
 		return;
 	}
 
