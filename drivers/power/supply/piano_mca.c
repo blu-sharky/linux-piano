@@ -337,8 +337,11 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_LOW_IBUS_MA	300	/* leaves when below for MCA_CP_LOW_POLLS */
 #define MCA_CP_TRIP_IBUS_MA	500	/* leaves at once this far above the target */
 #define MCA_CP_TRIP_IBAT_MA	1000
-/* a lowered battery limit trips only this long after it was lowered */
-#define MCA_CP_TRIP_GRACE_MS	5000
+/*
+ * A lowered battery limit trips only this long after the stage reached
+ * its lowered target: the gauges average over 10-15 s
+ */
+#define MCA_CP_TRIP_GRACE_MS	30000
 #define MCA_CP_LOW_POLLS	6
 #define MCA_CP_LOG_POLLS	20
 /* see piano_mca_cp_learn_drop() */
@@ -454,7 +457,8 @@ struct piano_mca {
 	u32 cp_ibus_ma;		/* bus current target */
 	u32 cp_ibus_hot;	/* the target as lowered for the stage temperature */
 	u32 cp_ibat_trip;	/* battery current limit the trip checks against */
-	unsigned long cp_trip_at;	/* jiffies when the limit was last that high */
+	/* jiffies when the limit was last that high, or the stage above target */
+	unsigned long cp_trip_at;
 	bool cp_warm;		/* battery limit reduced for temperature */
 	unsigned long cp_warm_at;	/* jiffies when it last was too warm */
 	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
@@ -1546,6 +1550,9 @@ static void piano_mca_cp_step(struct piano_mca *mca)
 		else if (ibus + MCA_CP_BAND_MA < target &&
 			 ibat + MCA_CP_BAND_MA < ibat_max)
 			mv += MCA_CP_REG_STEP_MV;
+		/* the gauges catch up with a lowered limit only from here */
+		if (over > MCA_CP_BAND_MA)
+			mca->cp_trip_at = jiffies;
 
 		if (++mca->cp_polls % MCA_CP_LOG_POLLS == 0)
 			dev_info(mca->dev, "direct charging at %u mV: bus %d mV %d/%d mA, battery %d mV %d/%d mA %d degC, stage %d.%d degC\n",
