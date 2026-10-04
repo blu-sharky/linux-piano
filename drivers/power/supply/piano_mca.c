@@ -278,6 +278,8 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_TBAT_WARM	40	/* MCA_CP_IBAT_REDUCED_MA from */
 #define MCA_CP_TBAT_EXIT	45
 #define MCA_CP_TBAT_HYS		2
+/* the pack reading moves 38-40 degC within seconds: held reduced this long */
+#define MCA_CP_TBAT_HOLD_MS	30000
 #define MCA_CP_IBAT_MAX_MA	8000
 #define MCA_CP_IBAT_REDUCED_MA	4500
 /*
@@ -454,6 +456,7 @@ struct piano_mca {
 	u32 cp_ibat_trip;	/* battery current limit the trip checks against */
 	unsigned long cp_trip_at;	/* jiffies when the limit was last that high */
 	bool cp_warm;		/* battery limit reduced for temperature */
+	unsigned long cp_warm_at;	/* jiffies when it last was too warm */
 	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
@@ -1295,9 +1298,14 @@ static u32 piano_mca_cp_ibat_limit(struct piano_mca *mca, int vbat,
 {
 	u32 ma = clamp(cp_ibat_max, 1000U, (u32)MCA_CP_IBAT_MAX_MA);
 
-	mca->cp_warm = twarm >= MCA_CP_TBAT_WARM ||
-		       (mca->cp_warm &&
-			twarm > MCA_CP_TBAT_WARM - MCA_CP_TBAT_HYS);
+	if (twarm >= MCA_CP_TBAT_WARM) {
+		mca->cp_warm = true;
+		mca->cp_warm_at = jiffies;
+	} else if (twarm <= MCA_CP_TBAT_WARM - MCA_CP_TBAT_HYS &&
+		   time_after(jiffies, mca->cp_warm_at +
+				       msecs_to_jiffies(MCA_CP_TBAT_HOLD_MS))) {
+		mca->cp_warm = false;
+	}
 	if (mca->cp_warm || tcool < MCA_CP_TBAT_FULL)
 		ma = min_t(u32, ma, MCA_CP_IBAT_REDUCED_MA);
 	if (vbat >= MCA_CP_VSTEP_MV)
