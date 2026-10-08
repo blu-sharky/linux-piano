@@ -1960,7 +1960,7 @@ CONFIG_MEMTEST=y
 # cpio.gz; set it in out/.config when embedding an initramfs.
 # DRM_PANIC QR screen (=y in the golden config) needs RUST=y and is omitted
 # here for CI portability; enable it locally if wanted.
-CONFIG_CMDLINE="console=tty0 loglevel=8 fbcon=font:TER16x32 rdinit=/beaconinit pd_ignore_unused clk_ignore_unused panic_on_oops=1 panic=-1"
+CONFIG_CMDLINE="console=tty0 loglevel=8 fbcon=font:TER16x32 rdinit=/beaconinit pd_ignore_unused clk_ignore_unused mem_sleep_default=s2idle panic_on_oops=1 panic=-1"
 CONFIG_CMDLINE_FORCE=y
 CONFIG_DRM_SIMPLEDRM=y
 CONFIG_DRM_FBDEV_EMULATION=y
